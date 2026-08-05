@@ -1,0 +1,18 @@
+{
+  "time_limit_s": 420.0,
+  "scores": {"s1": 1, "s2": 2, "s3": 6, "s4": 1, "s5": 10, "upright_bonus": 5},
+  "penalties": {"collision": 5, "topple": 5, "drop": 3},
+  "thresholds": {
+    "carry_out_dist": 0.20,
+    "settle_speed": 0.02,
+    "upright_tol_deg": 15.0,
+    "topple_tilt_deg": 30.0,
+    "topple_xy_shift": 0.05,
+    "drop_z": 0.30
+  },
+  "zones": {
+    "picking": {"x": [-2.5, 2.5], "y": [1.70, 3.25]},
+    "delivery_base": {"x": [-2.42, -1.46], "y": [-3.88, -2.62]},
+    "delivery_box": {"x": [-2.42, -1.46], "y": [-3.63, -3.19], "z": [0.74, 1.05]}
+  }
+}

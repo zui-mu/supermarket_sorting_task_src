@@ -1,0 +1,12 @@
+# 增量更新镜像：基于已装好依赖的 :perception，覆盖为最新代码
+FROM supermarket_sorting_task:perception
+
+WORKDIR /workspace
+RUN rm -rf /workspace/supermarket_sorting_task
+COPY . /workspace/supermarket_sorting_task
+WORKDIR /workspace/supermarket_sorting_task
+
+# 重置被固化成 [bash] 的坏 ENTRYPOINT，恢复标准 shell 形式，
+# 使 `docker run <img> bash -lc "..."` 正常工作
+ENTRYPOINT []
+CMD ["bash"]

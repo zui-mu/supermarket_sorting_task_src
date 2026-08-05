@@ -1,0 +1,20 @@
+[submodule "submodules/ComfyUI"]
+	path = submodules/ComfyUI
+	url = https://github.com/comfyanonymous/ComfyUI.git
+[submodule "policies/act"]
+	path = policies/act
+	url = https://github.com/OpenGHz/Imitate-All.git
+[submodule "submodules/MuJoCo-LiDAR"]
+	path = submodules/MuJoCo-LiDAR
+	url = https://github.com/TATP-233/MuJoCo-LiDAR
+[submodule "submodules/lerobot"]
+	path = submodules/lerobot
+	url = https://github.com/huggingface/lerobot
+[submodule "submodules/XML-Editor"]
+	path = submodules/XML-Editor
+	url = https://github.com/LZQ1204/XML-Editor.git
+	branch = main
+[submodule "submodules/urdf2mjcf"]
+	path = submodules/urdf2mjcf
+	url = https://github.com/TATP-233/urdf2mjcf
+

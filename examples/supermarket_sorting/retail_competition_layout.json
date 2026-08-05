@@ -1,0 +1,632 @@
+[
+  {
+    "shelf": "A",
+    "level": "L1",
+    "column": "C1",
+    "aruco_id": 0,
+    "body": "slot_A_L1_C1_sanmingzhi",
+    "object_kind": "sanmingzhi",
+    "gs_ply": "shentoon/sanmingzhi_fit.ply",
+    "world_position": [
+      -1.955,
+      3.243,
+      0.5484
+    ]
+  },
+  {
+    "shelf": "A",
+    "level": "L1",
+    "column": "C2",
+    "aruco_id": 1,
+    "body": "slot_A_L1_C2_heweidao",
+    "object_kind": "heweidao",
+    "gs_ply": "shentoon/heweidao_fit.ply",
+    "world_position": [
+      -1.735,
+      3.243,
+      0.5515
+    ]
+  },
+  {
+    "shelf": "A",
+    "level": "L1",
+    "column": "C3",
+    "aruco_id": 2,
+    "body": "slot_A_L1_C3_shupian",
+    "object_kind": "shupian",
+    "gs_ply": "shentoon/shupian_fit.ply",
+    "world_position": [
+      -1.515,
+      3.243,
+      0.604
+    ]
+  },
+  {
+    "shelf": "A",
+    "level": "L2",
+    "column": "C1",
+    "aruco_id": 3,
+    "body": "slot_A_L2_C1_zhijin",
+    "object_kind": "zhijin",
+    "gs_ply": "shentoon/zhijin_fit.ply",
+    "world_position": [
+      -1.955,
+      3.243,
+      0.895
+    ]
+  },
+  {
+    "shelf": "A",
+    "level": "L2",
+    "column": "C2",
+    "aruco_id": 4,
+    "body": "slot_A_L2_C2_maidong",
+    "object_kind": "maidong",
+    "gs_ply": "shentoon/maidong_fit.ply",
+    "world_position": [
+      -1.735,
+      3.243,
+      0.956
+    ]
+  },
+  {
+    "shelf": "A",
+    "level": "L2",
+    "column": "C3",
+    "aruco_id": 5,
+    "body": "slot_A_L2_C3_maidong",
+    "object_kind": "maidong",
+    "gs_ply": "shentoon/maidong_fit.ply",
+    "world_position": [
+      -1.515,
+      3.243,
+      0.956
+    ]
+  },
+  {
+    "shelf": "A",
+    "level": "L3",
+    "column": "C1",
+    "aruco_id": 6,
+    "body": "slot_A_L3_C1_kouxiangtang",
+    "object_kind": "kouxiangtang",
+    "gs_ply": "shentoon/kouxiangtang_fit.ply",
+    "world_position": [
+      -1.955,
+      3.243,
+      1.229
+    ]
+  },
+  {
+    "shelf": "A",
+    "level": "L3",
+    "column": "C2",
+    "aruco_id": 7,
+    "body": "slot_A_L3_C2_pingguo",
+    "object_kind": "pingguo",
+    "gs_ply": "shentoon/pingguo_fit.ply",
+    "world_position": [
+      -1.735,
+      3.243,
+      1.224
+    ]
+  },
+  {
+    "shelf": "A",
+    "level": "L3",
+    "column": "C3",
+    "aruco_id": 8,
+    "body": "slot_A_L3_C3_chengzi",
+    "object_kind": "chengzi",
+    "gs_ply": "shentoon/chengzi_fit.ply",
+    "world_position": [
+      -1.515,
+      3.243,
+      1.226
+    ]
+  },
+  {
+    "shelf": "B",
+    "level": "L1",
+    "column": "C1",
+    "aruco_id": 9,
+    "body": "slot_B_L1_C1_sanmingzhi",
+    "object_kind": "sanmingzhi",
+    "gs_ply": "shentoon/sanmingzhi_fit.ply",
+    "world_position": [
+      -1.07,
+      3.243,
+      0.5484
+    ]
+  },
+  {
+    "shelf": "B",
+    "level": "L1",
+    "column": "C2",
+    "aruco_id": 10,
+    "body": "slot_B_L1_C2_heweidao",
+    "object_kind": "heweidao",
+    "gs_ply": "shentoon/heweidao_fit.ply",
+    "world_position": [
+      -0.85,
+      3.243,
+      0.5515
+    ]
+  },
+  {
+    "shelf": "B",
+    "level": "L1",
+    "column": "C3",
+    "aruco_id": 11,
+    "body": "slot_B_L1_C3_shupian",
+    "object_kind": "shupian",
+    "gs_ply": "shentoon/shupian_fit.ply",
+    "world_position": [
+      -0.63,
+      3.243,
+      0.604
+    ]
+  },
+  {
+    "shelf": "B",
+    "level": "L2",
+    "column": "C1",
+    "aruco_id": 12,
+    "body": "slot_B_L2_C1_zhijin",
+    "object_kind": "zhijin",
+    "gs_ply": "shentoon/zhijin_fit.ply",
+    "world_position": [
+      -1.07,
+      3.243,
+      0.895
+    ]
+  },
+  {
+    "shelf": "B",
+    "level": "L2",
+    "column": "C2",
+    "aruco_id": 13,
+    "body": "slot_B_L2_C2_maidong",
+    "object_kind": "maidong",
+    "gs_ply": "shentoon/maidong_fit.ply",
+    "world_position": [
+      -0.85,
+      3.243,
+      0.956
+    ]
+  },
+  {
+    "shelf": "B",
+    "level": "L2",
+    "column": "C3",
+    "aruco_id": 14,
+    "body": "slot_B_L2_C3_kele",
+    "object_kind": "kele",
+    "gs_ply": "shentoon/kele_fit.ply",
+    "world_position": [
+      -0.63,
+      3.243,
+      0.9235
+    ]
+  },
+  {
+    "shelf": "B",
+    "level": "L3",
+    "column": "C1",
+    "aruco_id": 15,
+    "body": "slot_B_L3_C1_kouxiangtang",
+    "object_kind": "kouxiangtang",
+    "gs_ply": "shentoon/kouxiangtang_fit.ply",
+    "world_position": [
+      -1.07,
+      3.243,
+      1.229
+    ]
+  },
+  {
+    "shelf": "B",
+    "level": "L3",
+    "column": "C2",
+    "aruco_id": 16,
+    "body": "slot_B_L3_C2_pingguo",
+    "object_kind": "pingguo",
+    "gs_ply": "shentoon/pingguo_fit.ply",
+    "world_position": [
+      -0.85,
+      3.243,
+      1.224
+    ]
+  },
+  {
+    "shelf": "B",
+    "level": "L3",
+    "column": "C3",
+    "aruco_id": 17,
+    "body": "slot_B_L3_C3_chengzi",
+    "object_kind": "chengzi",
+    "gs_ply": "shentoon/chengzi_fit.ply",
+    "world_position": [
+      -0.63,
+      3.243,
+      1.226
+    ]
+  },
+  {
+    "shelf": "C",
+    "level": "L1",
+    "column": "C1",
+    "aruco_id": 18,
+    "body": "slot_C_L1_C1_sanmingzhi",
+    "object_kind": "sanmingzhi",
+    "gs_ply": "shentoon/sanmingzhi_fit.ply",
+    "world_position": [
+      -0.185,
+      3.243,
+      0.5484
+    ]
+  },
+  {
+    "shelf": "C",
+    "level": "L1",
+    "column": "C2",
+    "aruco_id": 19,
+    "body": "slot_C_L1_C2_heweidao",
+    "object_kind": "heweidao",
+    "gs_ply": "shentoon/heweidao_fit.ply",
+    "world_position": [
+      0.035,
+      3.243,
+      0.5515
+    ]
+  },
+  {
+    "shelf": "C",
+    "level": "L1",
+    "column": "C3",
+    "aruco_id": 20,
+    "body": "slot_C_L1_C3_shupian",
+    "object_kind": "shupian",
+    "gs_ply": "shentoon/shupian_fit.ply",
+    "world_position": [
+      0.255,
+      3.243,
+      0.604
+    ]
+  },
+  {
+    "shelf": "C",
+    "level": "L2",
+    "column": "C1",
+    "aruco_id": 21,
+    "body": "slot_C_L2_C1_zhijin",
+    "object_kind": "zhijin",
+    "gs_ply": "shentoon/zhijin_fit.ply",
+    "world_position": [
+      -0.185,
+      3.243,
+      0.895
+    ]
+  },
+  {
+    "shelf": "C",
+    "level": "L2",
+    "column": "C2",
+    "aruco_id": 22,
+    "body": "slot_C_L2_C2_maidong",
+    "object_kind": "maidong",
+    "gs_ply": "shentoon/maidong_fit.ply",
+    "world_position": [
+      0.035,
+      3.243,
+      0.956
+    ]
+  },
+  {
+    "shelf": "C",
+    "level": "L2",
+    "column": "C3",
+    "aruco_id": 23,
+    "body": "slot_C_L2_C3_kele",
+    "object_kind": "kele",
+    "gs_ply": "shentoon/kele_fit.ply",
+    "world_position": [
+      0.255,
+      3.243,
+      0.9235
+    ]
+  },
+  {
+    "shelf": "C",
+    "level": "L3",
+    "column": "C1",
+    "aruco_id": 24,
+    "body": "slot_C_L3_C1_kouxiangtang",
+    "object_kind": "kouxiangtang",
+    "gs_ply": "shentoon/kouxiangtang_fit.ply",
+    "world_position": [
+      -0.185,
+      3.243,
+      1.229
+    ]
+  },
+  {
+    "shelf": "C",
+    "level": "L3",
+    "column": "C2",
+    "aruco_id": 25,
+    "body": "slot_C_L3_C2_pingguo",
+    "object_kind": "pingguo",
+    "gs_ply": "shentoon/pingguo_fit.ply",
+    "world_position": [
+      0.035,
+      3.243,
+      1.224
+    ]
+  },
+  {
+    "shelf": "C",
+    "level": "L3",
+    "column": "C3",
+    "aruco_id": 26,
+    "body": "slot_C_L3_C3_chengzi",
+    "object_kind": "chengzi",
+    "gs_ply": "shentoon/chengzi_fit.ply",
+    "world_position": [
+      0.255,
+      3.243,
+      1.226
+    ]
+  },
+  {
+    "shelf": "D",
+    "level": "L1",
+    "column": "C1",
+    "aruco_id": 27,
+    "body": "slot_D_L1_C1_sanmingzhi",
+    "object_kind": "sanmingzhi",
+    "gs_ply": "shentoon/sanmingzhi_fit.ply",
+    "world_position": [
+      0.7,
+      3.243,
+      0.5484
+    ]
+  },
+  {
+    "shelf": "D",
+    "level": "L1",
+    "column": "C2",
+    "aruco_id": 28,
+    "body": "slot_D_L1_C2_heweidao",
+    "object_kind": "heweidao",
+    "gs_ply": "shentoon/heweidao_fit.ply",
+    "world_position": [
+      0.92,
+      3.243,
+      0.5515
+    ]
+  },
+  {
+    "shelf": "D",
+    "level": "L1",
+    "column": "C3",
+    "aruco_id": 29,
+    "body": "slot_D_L1_C3_shupian",
+    "object_kind": "shupian",
+    "gs_ply": "shentoon/shupian_fit.ply",
+    "world_position": [
+      1.14,
+      3.243,
+      0.604
+    ]
+  },
+  {
+    "shelf": "D",
+    "level": "L2",
+    "column": "C1",
+    "aruco_id": 30,
+    "body": "slot_D_L2_C1_zhijin",
+    "object_kind": "zhijin",
+    "gs_ply": "shentoon/zhijin_fit.ply",
+    "world_position": [
+      0.7,
+      3.243,
+      0.895
+    ]
+  },
+  {
+    "shelf": "D",
+    "level": "L2",
+    "column": "C2",
+    "aruco_id": 31,
+    "body": "slot_D_L2_C2_kele",
+    "object_kind": "kele",
+    "gs_ply": "shentoon/kele_fit.ply",
+    "world_position": [
+      0.92,
+      3.243,
+      0.9235
+    ]
+  },
+  {
+    "shelf": "D",
+    "level": "L2",
+    "column": "C3",
+    "aruco_id": 32,
+    "body": "slot_D_L2_C3_kele",
+    "object_kind": "kele",
+    "gs_ply": "shentoon/kele_fit.ply",
+    "world_position": [
+      1.14,
+      3.243,
+      0.9235
+    ]
+  },
+  {
+    "shelf": "D",
+    "level": "L3",
+    "column": "C1",
+    "aruco_id": 33,
+    "body": "slot_D_L3_C1_kouxiangtang",
+    "object_kind": "kouxiangtang",
+    "gs_ply": "shentoon/kouxiangtang_fit.ply",
+    "world_position": [
+      0.7,
+      3.243,
+      1.229
+    ]
+  },
+  {
+    "shelf": "D",
+    "level": "L3",
+    "column": "C2",
+    "aruco_id": 34,
+    "body": "slot_D_L3_C2_pingguo",
+    "object_kind": "pingguo",
+    "gs_ply": "shentoon/pingguo_fit.ply",
+    "world_position": [
+      0.92,
+      3.243,
+      1.224
+    ]
+  },
+  {
+    "shelf": "D",
+    "level": "L3",
+    "column": "C3",
+    "aruco_id": 35,
+    "body": "slot_D_L3_C3_chengzi",
+    "object_kind": "chengzi",
+    "gs_ply": "shentoon/chengzi_fit.ply",
+    "world_position": [
+      1.14,
+      3.243,
+      1.226
+    ]
+  },
+  {
+    "shelf": "E",
+    "level": "L1",
+    "column": "C1",
+    "aruco_id": 36,
+    "body": "slot_E_L1_C1_sanmingzhi",
+    "object_kind": "sanmingzhi",
+    "gs_ply": "shentoon/sanmingzhi_fit.ply",
+    "world_position": [
+      1.585,
+      3.243,
+      0.5484
+    ]
+  },
+  {
+    "shelf": "E",
+    "level": "L1",
+    "column": "C2",
+    "aruco_id": 37,
+    "body": "slot_E_L1_C2_heweidao",
+    "object_kind": "heweidao",
+    "gs_ply": "shentoon/heweidao_fit.ply",
+    "world_position": [
+      1.805,
+      3.243,
+      0.5515
+    ]
+  },
+  {
+    "shelf": "E",
+    "level": "L1",
+    "column": "C3",
+    "aruco_id": 38,
+    "body": "slot_E_L1_C3_shupian",
+    "object_kind": "shupian",
+    "gs_ply": "shentoon/shupian_fit.ply",
+    "world_position": [
+      2.025,
+      3.243,
+      0.604
+    ]
+  },
+  {
+    "shelf": "E",
+    "level": "L2",
+    "column": "C1",
+    "aruco_id": 39,
+    "body": "slot_E_L2_C1_zhijin",
+    "object_kind": "zhijin",
+    "gs_ply": "shentoon/zhijin_fit.ply",
+    "world_position": [
+      1.585,
+      3.243,
+      0.895
+    ]
+  },
+  {
+    "shelf": "E",
+    "level": "L2",
+    "column": "C2",
+    "aruco_id": 40,
+    "body": "slot_E_L2_C2_maidong",
+    "object_kind": "maidong",
+    "gs_ply": "shentoon/maidong_fit.ply",
+    "world_position": [
+      1.805,
+      3.243,
+      0.956
+    ]
+  },
+  {
+    "shelf": "E",
+    "level": "L2",
+    "column": "C3",
+    "aruco_id": 41,
+    "body": "slot_E_L2_C3_kele",
+    "object_kind": "kele",
+    "gs_ply": "shentoon/kele_fit.ply",
+    "world_position": [
+      2.025,
+      3.243,
+      0.9235
+    ]
+  },
+  {
+    "shelf": "E",
+    "level": "L3",
+    "column": "C1",
+    "aruco_id": 42,
+    "body": "slot_E_L3_C1_kouxiangtang",
+    "object_kind": "kouxiangtang",
+    "gs_ply": "shentoon/kouxiangtang_fit.ply",
+    "world_position": [
+      1.585,
+      3.243,
+      1.229
+    ]
+  },
+  {
+    "shelf": "E",
+    "level": "L3",
+    "column": "C2",
+    "aruco_id": 43,
+    "body": "slot_E_L3_C2_pingguo",
+    "object_kind": "pingguo",
+    "gs_ply": "shentoon/pingguo_fit.ply",
+    "world_position": [
+      1.805,
+      3.243,
+      1.224
+    ]
+  },
+  {
+    "shelf": "E",
+    "level": "L3",
+    "column": "C3",
+    "aruco_id": 44,
+    "body": "slot_E_L3_C3_chengzi",
+    "object_kind": "chengzi",
+    "gs_ply": "shentoon/chengzi_fit.ply",
+    "world_position": [
+      2.025,
+      3.243,
+      1.226
+    ]
+  }
+]
