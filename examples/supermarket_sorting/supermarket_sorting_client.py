@@ -387,12 +387,13 @@ SHELF_POS_TOL = max(0.055, float(os.getenv("SUPERMARKET_SHELF_POS_TOL", "0.055")
 CARRY_POS_TOL = float(os.getenv("SUPERMARKET_CARRY_POS_TOL", "0.06"))
 CARRY_SHELF_CLEAR_Y = float(os.getenv("SUPERMARKET_CARRY_SHELF_CLEAR_Y", "1.92"))
 DELIVERY_GOAL = np.array([-1.88, -2.74], dtype=float)
-DELIVERY_USE_ASTAR = os.getenv("SUPERMARKET_DELIVERY_USE_ASTAR", "0") == "1"
+DELIVERY_USE_ASTAR = os.getenv("SUPERMARKET_DELIVERY_USE_ASTAR", "1") == "1"
 DELIVERY_SAFE_WAYPOINTS = [
-    np.array([-0.50, SHELF_CROSS_Y], dtype=float),
-    np.array([-0.50, -0.70], dtype=float),
-    np.array([-0.90, -0.70], dtype=float),
-    np.array([-0.90, -2.80], dtype=float),
+    np.array([0.18, 2.04], dtype=float),
+    np.array([-0.45, 1.42], dtype=float),
+    np.array([-0.45, -0.70], dtype=float),
+    np.array([-1.45, -0.70], dtype=float),
+    np.array([-1.45, -1.58], dtype=float),
     DELIVERY_GOAL.copy(),
 ]
 RETRY_RETREAT_MARGIN = float(os.getenv("SUPERMARKET_RETRY_RETREAT_MARGIN", "0.035"))
@@ -1563,36 +1564,34 @@ class PickPlaceClient(Node):
         return route
 
     def delivery_corridor_route(self):
-        """Build a conservative table route that avoids shelf and wall cut-ins.
+        """Build a conservative table route that respects the centre divider.
 
-        When the robot has just cleared the shelf, rotating immediately toward
-        the west corridor tends to scrape the carried object against the wall or
-        the shelf mouth.  First drive farther south along the current X, then
-        merge into the fixed corridor and only later cross toward the table.
+        The official V2 arena has a long divider around x~=0.53 from the table
+        area up to y~=1.70.  A previous fallback crossed at y=1.05 and could
+        therefore drive the loaded robot into the divider.  Keep the crossing
+        above that divider, then descend on the left side toward the table.
         """
         start = np.asarray(self.base_xy, dtype=float) if self.base_xy is not None else None
-        lane_x = float(np.clip(SAFE_RIGHT_LANE_X, SAFE_X_MIN + 0.18, SAFE_X_MAX - 0.18))
+        opening_y = 2.04
         candidates = []
-        if start is not None and start[1] > SAFE_STAGING_Y + 0.18:
-            candidates.append(np.array([start[0], SAFE_STAGING_Y], dtype=float))
-        if start is not None and float(start[0]) > lane_x + 0.18:
-            candidates.append(np.array([lane_x, SAFE_STAGING_Y], dtype=float))
-        candidates.extend([
-            np.array([-0.50, SAFE_STAGING_Y], dtype=float),
-            np.array([-0.50, -0.70], dtype=float),
-            np.array([-0.90, -0.70], dtype=float),
-            np.array([-0.90, -2.80], dtype=float),
-            DELIVERY_GOAL.copy(),
-        ])
+        if start is not None and start[0] > 0.08:
+            candidates.append(np.array([start[0], opening_y], dtype=float))
+            candidates.extend(DELIVERY_SAFE_WAYPOINTS)
+        elif start is not None and start[0] < -1.20:
+            candidates.extend([
+                np.array([max(start[0], -1.65), opening_y], dtype=float),
+                np.array([-1.65, -0.68], dtype=float),
+                np.array([-1.45, -0.68], dtype=float),
+                np.array([-1.45, -1.58], dtype=float),
+                DELIVERY_GOAL.copy(),
+            ])
+        else:
+            candidates.extend(DELIVERY_SAFE_WAYPOINTS[1:])
         route = []
         for waypoint in candidates:
             point = np.asarray(waypoint, dtype=float)
             if start is not None:
                 if np.linalg.norm(point - start) < 0.12:
-                    continue
-                # If recovery happens after the robot is already south of a
-                # corridor gate, do not drive back north just to hit it.
-                if point[1] > start[1] + 0.25 and start[1] < 1.80:
                     continue
             route.append(point.tolist())
         if not route or np.linalg.norm(np.asarray(route[-1]) - DELIVERY_GOAL) > 0.05:
@@ -1755,9 +1754,21 @@ class PickPlaceClient(Node):
                     # Avoid "dancing in place" at long waypoints. Once the
                     # heading is roughly correct, move and let continuous
                     # steering remove the remaining error.
-                    self.nav_mode = "drive"
-                    creep_forward = min(0.22, max(0.10, 0.35 * dist))
-                    self.set_twist(creep_forward, float(np.clip(1.4 * yaw_err, -0.45, 0.45)))
+                    if self.phase == NAV_TABLE:
+                        carry_angular = float(self.grasp_profile.get("carry_angular_speed", CARRY_ANGULAR_SPEED))
+                        if abs(yaw_err) > 0.70:
+                            self.set_twist(0.0, float(np.clip(1.4 * yaw_err, -carry_angular, carry_angular)))
+                            return False
+                        self.nav_mode = "drive"
+                        creep_forward = min(0.12, max(0.06, 0.22 * dist))
+                        self.set_twist(
+                            creep_forward,
+                            float(np.clip(1.0 * yaw_err, -carry_angular, carry_angular)),
+                        )
+                    else:
+                        self.nav_mode = "drive"
+                        creep_forward = min(0.22, max(0.10, 0.35 * dist))
+                        self.set_twist(creep_forward, float(np.clip(1.4 * yaw_err, -0.45, 0.45)))
                 else:
                     turn_cmd = float(np.clip(1.7 * yaw_err, -0.75, 0.75))
                     if self.phase == NAV_TABLE:
@@ -1807,7 +1818,11 @@ class PickPlaceClient(Node):
                     self.set_twist(requested_speed, ang)
             return False
         yaw_err = wrap_to_pi(final_yaw - self.base_yaw)
-        self.set_twist(0.0, 1.8 * yaw_err)
+        final_turn_cmd = 1.8 * yaw_err
+        if self.phase == NAV_TABLE:
+            carry_angular = float(self.grasp_profile.get("carry_angular_speed", CARRY_ANGULAR_SPEED))
+            final_turn_cmd = float(np.clip(final_turn_cmd, -carry_angular, carry_angular))
+        self.set_twist(0.0, final_turn_cmd)
         final_turn_tol = SHELF_FINAL_YAW_TOL if self.phase == NAV_SHELF else self.turn_tol
         if abs(yaw_err) < final_turn_tol:
             self.set_twist(0.0, 0.0)
