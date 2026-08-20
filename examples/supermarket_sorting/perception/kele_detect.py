@@ -46,7 +46,11 @@ from std_msgs.msg import String
 from discoverse.robots.mmk2.mmk2_fk import MMK2FK
 
 from backends import GtProjectionBackend, BlobBackend, YoloBackend
-from inventory import associate_detections_to_markers
+from inventory import (
+    associate_detections_to_markers,
+    match_detections_to_markers,
+    aruco_id_to_slot,
+)
 
 LAYOUT_JSON = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "..", "retail_competition_layout.json")
@@ -268,7 +272,7 @@ class KeleDetectNode(Node):
                             0.5, (0, 255, 0), 1)
 
         self.publish_detections(out, msg.header.stamp)
-        self.publish_inventory_observations(rgb, dets, out, depth, T_cam_world, rgb_stamp_sec)
+        self.publish_inventory_observations(rgb, dets, out, depth, T_cam_world, rgb_stamp_sec, vis)
         now = self.get_clock().now().nanoseconds * 1e-9
         if now - self.last_detection_log > 1.0:
             self.get_logger().info(
@@ -298,7 +302,7 @@ class KeleDetectNode(Node):
         self.det_pub.publish(msg)
         self.legacy_det_pub.publish(msg)
 
-    def publish_inventory_observations(self, rgb, detections, records, depth, T_cam_world, stamp_sec):
+    def publish_inventory_observations(self, rgb, detections, records, depth, T_cam_world, stamp_sec, vis=None):
         """Publish only unambiguous product-to-visible-marker observations."""
         gray = cv2.cvtColor(rgb, cv2.COLOR_BGR2GRAY)
         corners, ids, _ = self.aruco_detector.detectMarkers(gray)
@@ -323,14 +327,44 @@ class KeleDetectNode(Node):
         filtered = [det for _, det in indexed_valid]
         source_of_filtered = [index for index, _ in indexed_valid]
         observations = []
-        for match in associate_detections_to_markers(filtered, markers):
+        # Round 62 (PR1): robust one-to-one matcher with rejection reasons.
+        matches, assoc_details = match_detections_to_markers(filtered, markers)
+        for match_index, match in enumerate(matches):
             source_index = source_of_filtered[match["detection_index"]]
             record = by_source.get(source_index)
             if record is None:
                 continue
-            marker = next(marker for marker in markers if marker["id"] == match["aruco_id"])
+            if match.get("aruco_id") is None:
+                # Diagnostic-only observation (not written to formal inventory):
+                # report why this detection was NOT bound to a slot.
+                observations.append({
+                    "aruco_id": None,
+                    "kind": record["class"],
+                    "confidence": float(record["conf"]),
+                    "reject_reason": match.get("reject_reason", "unbound"),
+                    "ambiguous": bool(match.get("ambiguous", False)),
+                    "world": [float(value) for value in record["world"]],
+                    "stamp": float(stamp_sec),
+                })
+                continue
+            marker = next((m for m in markers if m["id"] == match["aruco_id"]), None)
+            if marker is None:
+                continue
             marker_corners = np.asarray(marker["corners"], dtype=float)
             marker_u, marker_v = np.mean(marker_corners, axis=0).astype(int)
+            # PR1 diagnostics: draw the product->tag link + score on the debug
+            # image so every frame answers "bound to which ArUco, how good".
+            if vis is not None:
+                det = filtered[match["detection_index"]]
+                pu, pv = int(det["x"]), int(det["y"])
+                colour = (0, 255, 0) if not match.get("ambiguous") else (0, 165, 255)
+                cv2.line(vis, (pu, pv), (int(marker_u), int(marker_v)), colour, 1)
+                cv2.putText(
+                    vis,
+                    f"a{match['aruco_id']}:{match['score']:.2f}",
+                    ((pu + int(marker_u)) // 2 + 4, (pv + int(marker_v)) // 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, colour, 1,
+                )
             marker_depth_m = self.patch_depth_m(depth, int(marker_u), int(marker_v))
             marker_world = None
             if marker_depth_m > 0.0:
@@ -338,11 +372,18 @@ class KeleDetectNode(Node):
                 marker_world = (T_cam_world @ np.array([
                     marker_cam[0], marker_cam[1], marker_cam[2], 1.0,
                 ]))[:3]
+            slot = aruco_id_to_slot(match["aruco_id"]) or {}
             observations.append({
                 "aruco_id": match["aruco_id"],
+                "slot_id": slot.get("slot_id"),
+                "shelf": slot.get("shelf"),
+                "level": slot.get("level"),
+                "column": slot.get("column"),
                 "kind": record["class"],
                 "confidence": float(record["conf"]),
                 "association_score": float(match["score"]),
+                "reject_reason": match.get("reject_reason", "ok"),
+                "ambiguous": bool(match.get("ambiguous", False)),
                 "world": [float(value) for value in record["world"]],
                 "marker_world": (
                     None if marker_world is None
@@ -352,7 +393,10 @@ class KeleDetectNode(Node):
             })
         if observations:
             payload = String()
-            payload.data = json.dumps({"schema_version": 1, "observations": observations})
+            payload.data = json.dumps({
+                "schema_version": 2,
+                "observations": observations,
+            })
             self.inventory_pub.publish(payload)
 
 
