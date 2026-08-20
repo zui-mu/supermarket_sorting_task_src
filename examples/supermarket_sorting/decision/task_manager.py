@@ -531,6 +531,26 @@ class TaskManager:
         self.tasks = [self._layout_item_to_task(item) for item in self.layout_items if item['body'] in wanted]
         return self.tasks
 
+    def _inventory_has_all_requested(self) -> bool:
+        """PR4: True when every requested kind already has enough CONFIRMED
+        inventory (identity) - scanning can stop, remaining picks use the
+        observed slots instead of visiting every shelf."""
+        if not self.requested_counts:
+            return False
+        now = time.time()
+        for kind, need in self.requested_counts.items():
+            if need <= 0:
+                continue
+            have = sum(
+                1 for rec in self.inventory_by_aruco.values()
+                if rec.get("confirmed") and rec.get("kind") == kind
+                and self._inventory_identity_fresh(rec, now=now)
+                and rec.get("state") != INVENTORY_STATE_CONSUMED
+            )
+            if have < need:
+                return False
+        return True
+
     def next_decision(self) -> DecisionResult:
         self.cycle_id += 1
         requested_total = sum(self.requested_counts.values())
@@ -538,6 +558,7 @@ class TaskManager:
             min(self.completed_counts[kind], count)
             for kind, count in self.requested_counts.items()
         )
+        all_requested = self._inventory_has_all_requested()
         pending = [
             task for task in self.tasks
             if task.status == TaskStatus.PENDING
@@ -546,6 +567,17 @@ class TaskManager:
                 (
                     task.metadata.get("search_mode")
                     and completed_total < requested_total
+                    and (
+                        # PR4: once every requested kind is confirmed in the
+                        # inventory, stop visiting un-scanned shelves - only
+                        # the already-OBSERVED search tasks stay selectable
+                        # (they are the ones we now go grasp).
+                        not all_requested
+                        or (
+                            (observation := self.inventory_by_aruco.get(int(task.aruco_id))) is not None
+                            and observation.get("confirmed")
+                        )
+                    )
                 )
                 or self.completed_counts[task.product_name] < self.requested_counts[task.product_name]
             )

@@ -1454,6 +1454,14 @@ class PickPlaceClient(Node):
         # harmless - the state is only consulted as a timeout fallback in
         # formal mode, never as the primary S5 gate (which stays local).
         self.create_subscription(String, "/referee/state", self.referee_state_cb, 5)
+        # PR4: consume the perception ArUco-bound observations so the grasp
+        # lock can require that THIS slot (aruco_id) was confirmed to hold the
+        # detected kind - instead of trusting a bare detection near the static
+        # search_slot_world (which can bind the neighbour's product to this
+        # slot in a randomized layout).
+        self.inventory_aruco_kind: dict[int, str] = {}
+        self.create_subscription(String, "/supermarket_sorting/inventory_observations",
+                                 self.inventory_observation_cb, 5)
         if self.test_oracle_enabled:
             self.get_logger().warn(
                 "[test_oracle] /referee/state is enabled for local verification only; "
@@ -2255,6 +2263,33 @@ class PickPlaceClient(Node):
         except (TypeError, json.JSONDecodeError):
             self.referee_state = {}
 
+    def inventory_observation_cb(self, msg):
+        """PR4: keep the ArUco-confirmed kind map for grasp re-verification.
+
+        Only ArUco-BOUND observations (schema v2 with a real aruco_id) update
+        the map; unbound/rejected observations never claim a slot.  A
+        previously confirmed identity can be replaced by a new consensus
+        (e.g. after a disturbed/re-scanned slot), but a transient
+        misclassification must not flip a confirmed slot: we only overwrite
+        when the new observation is itself confirmed (>= INVENTORY_MIN_HITS
+        is decided by the task manager; here we simply require a fresh,
+        bound, reasonably confident observation).
+        """
+        try:
+            payload = json.loads(msg.data)
+        except (TypeError, json.JSONDecodeError):
+            return
+        for observation in payload.get("observations", []):
+            try:
+                aid = int(observation["aruco_id"])
+                kind = str(observation["kind"]).strip()
+                conf = float(observation.get("confidence", 0.0))
+            except (KeyError, TypeError, ValueError):
+                continue
+            if not 0 <= aid < 45 or not kind or conf < 0.4:
+                continue
+            self.inventory_aruco_kind[aid] = kind
+
     def scan_cb(self, msg):
         self.scan_ranges = np.asarray(msg.ranges, dtype=float)
         self.scan_angle_min = float(msg.angle_min)
@@ -2744,6 +2779,20 @@ class PickPlaceClient(Node):
             ):
                 counts["class_reject"] += 1
                 continue
+            # PR4 grasp re-verification: if perception already CONFIRMED what
+            # kind this slot (aruco_id) holds, a detection of a DIFFERENT kind
+            # at this slot is a mis-bind - reject it instead of locking the
+            # wrong product (randomized layout: neighbour's product can appear
+            # at the static search_slot_world).
+            if (
+                self.active_search_mode()
+                and self.active_task is not None
+                and hasattr(self.active_task, "aruco_id")
+            ):
+                slot_kind = self.inventory_aruco_kind.get(int(self.active_task.aruco_id))
+                if slot_kind is not None and slot_kind != class_id:
+                    counts["class_reject"] += 1
+                    continue
             pos = det.results[0].pose.pose.position
             pw = np.array([pos.x, pos.y, pos.z])
             fp = self.world_to_footprint(pw)   # fp[0]=forward (ahead), fp[1]=lateral (left+)

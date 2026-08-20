@@ -531,6 +531,29 @@ class TaskManagerTests(unittest.TestCase):
         selected = manager.next_decision().selected_task
         self.assertEqual(selected.aruco_id, 23)
 
+    def test_pr4_stops_scan_when_all_requested_kinds_confirmed(self):
+        """PR4: once every requested kind is confirmed in the inventory, the
+        decision layer must stop selecting un-scanned shelf slots (the 45-slot
+        walk) and only keep the already-observed slots for grasping."""
+        manager = TaskManager()
+        # Two search tasks: slot 10 (observed+confirmed kele) and slot 20
+        # (never observed -> would be visited by the scan).
+        task_observed = self._manual_search_task("search_obs", 10, nav_x=0.70, nav_y=2.45)
+        task_unobserved = self._manual_search_task("search_scan", 20, nav_x=1.20, nav_y=2.45, column="C2")
+        manager.tasks = [task_observed, task_unobserved]
+        manager.requested_counts = Counter({"kele": 1})
+        now = time.time()
+        manager.inventory_by_aruco[10] = {
+            "kind": "kele", "confidence": 0.9,
+            "world": (0.70, 2.45, 0.94), "hits": 3, "confirmed": True,
+            "state": "confirmed", "first_seen": now - 2.0, "last_seen": now - 2.0,
+            "fresh_at": now - 2.0, "identity_seen_at": now - 2.0, "pose_seen_at": now - 2.0,
+        }
+        self.assertTrue(manager._inventory_has_all_requested())
+        selected = manager.next_decision().selected_task
+        # The confirmed slot is chosen; the un-observed scan slot is skipped.
+        self.assertEqual(selected.aruco_id, 10)
+
     def test_inventory_scoring_honours_manual_reservation_bonus(self):
         manager = TaskManager()
         task_reserved = self._manual_search_task("search_reserved", 31, nav_x=0.90, nav_y=2.45)
