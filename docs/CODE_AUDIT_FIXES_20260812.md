@@ -1748,3 +1748,19 @@ python -m unittest discover -s examples/supermarket_sorting/tests -p "test_*.py"
   实际场景识别 zhijin（score 0.65-0.995）+ 世界坐标稳定输出
 - 注意：.pt 被 .gitignore 排除，团队需单独分发；数据未提交
 - 待办：ArUco 货位绑定 + 本局库存表 + 货架扫描策略（阶段1）
+
+## Round 61f：正式模式 YOLO 搜索验证（感知位姿标定问题）
+- 已验证成功：正式匿名任务（只给 id+kind）下，YOLO 9 类模型能识别 zhijin 等商品类别，
+  detections 输出 world 坐标稳定；搜索模式"扫描货位→识别类别→绑定到 detected product"链路能跑。
+- **发现的卡点**：搜索模式几乎每个货位 deploy 后 "vision target timeout during deploy;
+  anonymous search candidate was not visually locked"→ 无法抓取。
+- 根因1（已修）：SEARCH_DETECT_TIMEOUT 2.5s 太短，6 FPS + YOLO 推理 + 3帧类别共识 +
+  N帧位姿稳定在 2.5s 做不完 → 已改 12s。
+- **根因2（未修，关键）**：det 中被大量 height_reject(23)/assoc_reject(14) 拒绝，
+  检测到的 zhijin 世界 z=0.50，而真实 L2 层 z≈0.895（L3≈1.23）——**YOLO 深度→世界坐标
+  有 ~0.4m 高度偏差**，或识别选错货位。GT 模式直接给真值所以从未暴露此问题。
+- **根因3（环境）**：runtime_layout.json 的 aruco_id/shelf/level 关联乱（slot_B_L2_C1 标 A L2 C1、
+  aruco 3；多个 zhijin 混在 A 架 L2/L3），随机化布局时关联错乱，搜索任务与真实货位对不上。
+- 待排查：感知节点 pixel_to_cam + T_cam_world 的深度标定（z 偏差来源）；
+  以及随机化时 aruco 关联是否可靠。这影响正式匿名任务能否正确锁定目标。
+- 已提交：SEARCH_DETECT_TIMEOUT 修复（Round 61e）。
