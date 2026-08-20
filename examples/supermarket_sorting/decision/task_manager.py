@@ -45,6 +45,18 @@ INVENTORY_SLOT_Y_BLEND_LIMIT = float(os.getenv("SUPERMARKET_INVENTORY_SLOT_Y_BLE
 INVENTORY_MAX_AGE_SEC = max(
     0.001, float(os.getenv("SUPERMARKET_INVENTORY_MAX_AGE_SEC", "12.0"))
 )
+# PR3: split the inventory into two time scales.  IDENTITY (aruco_id -> kind)
+# is long-lived within one run_prefix (the tag keeps telling you what slot it
+# is even after the robot delivered an item); POSE (exact coordinates) is
+# short-lived - it must be re-acquired right before grasping.  Keeping one
+# 12 s age for both made an already-scanned slot "expire" after a delivery
+# and forced a full rescan of the whole shelf.
+INVENTORY_POSE_MAX_AGE_SEC = max(
+    0.001, float(os.getenv("SUPERMARKET_INVENTORY_POSE_MAX_AGE_SEC", "12.0"))
+)
+INVENTORY_IDENTITY_MAX_AGE_SEC = max(
+    0.001, float(os.getenv("SUPERMARKET_INVENTORY_IDENTITY_MAX_AGE_SEC", "3600.0"))
+)
 # 归一化参考往返距离(m): 路径项除以它之后再乘权重, 使路径、置信度、新鲜度、
 # 风险各项处于同一量级, 避免"就近优先"完全压过其他信号。
 INVENTORY_ROUTE_REFERENCE_M = max(
@@ -224,6 +236,8 @@ class TaskManager:
                     "first_seen": stamp if stamp is not None else now,
                     "last_seen": stamp if stamp is not None else now,
                     "fresh_at": fresh_at,
+                    "identity_seen_at": fresh_at,
+                    "pose_seen_at": fresh_at,
                 }
                 if INVENTORY_MIN_HITS == 1:
                     accepted += 1
@@ -256,6 +270,8 @@ class TaskManager:
                     "first_seen": stamp if stamp is not None else now,
                     "last_seen": stamp if stamp is not None else now,
                     "fresh_at": fresh_at,
+                    "identity_seen_at": fresh_at,
+                    "pose_seen_at": fresh_at,
                 }
                 if INVENTORY_MIN_HITS == 1:
                     accepted += 1
@@ -294,7 +310,9 @@ class TaskManager:
             previous["state"] = INVENTORY_STATE_CONFIRMED if previous["confirmed"] else INVENTORY_STATE_OBSERVED
             previous["last_seen"] = stamp if stamp is not None else now
             previous["fresh_at"] = fresh_at
+            previous["pose_seen_at"] = fresh_at
             if previous["confirmed"] and not was_confirmed:
+                previous["identity_seen_at"] = fresh_at
                 accepted += 1
         return accepted
 
@@ -312,10 +330,27 @@ class TaskManager:
         return max(0.0, float(now) - seen)
 
     def _inventory_is_fresh(self, record: dict, *, now: float | None = None) -> bool:
+        # PR3: pose freshness (short-lived, re-acquire before grasp).
         age = self._inventory_age(record, now=now)
-        # A record without a usable timestamp cannot be proven fresh; treating
-        # it as permanently fresh would keep stale poses selectable forever.
-        return False if age is None else age <= INVENTORY_MAX_AGE_SEC
+        return False if age is None else age <= INVENTORY_POSE_MAX_AGE_SEC
+
+    def _inventory_identity_fresh(self, record: dict, *, now: float | None = None) -> bool:
+        # PR3: identity (aruco_id -> kind) is long-lived within the run: once
+        # confirmed it stays selectable (for a second identical order, for
+        # re-delivery) even after the pose went stale - the robot just has to
+        # re-observe the slot before grasping.
+        if now is None:
+            now = time.time()
+        seen = record.get("identity_seen_at")
+        try:
+            seen = float(seen)
+        except (TypeError, ValueError):
+            seen = record.get("fresh_at", record.get("last_seen"))
+            try:
+                seen = float(seen)
+            except (TypeError, ValueError):
+                return False
+        return max(0.0, float(now) - seen) <= INVENTORY_IDENTITY_MAX_AGE_SEC
 
     def _reserve_inventory_record(self, task: PickTask) -> bool:
         record = self.inventory_by_aruco.get(int(task.aruco_id))
@@ -389,6 +424,10 @@ class TaskManager:
         self.current_official_order = None
         self.failed_search_slots.clear()
         self.requested_counts = Counter(target["kind"] for target in normalized)
+        # PR3: a new run (new /task payload) starts a fresh inventory - the
+        # ArUco tags stay fixed but the products under them were re-randomised,
+        # so last run's identity table is void.
+        self.inventory_by_aruco.clear()
         # A new order must not inherit same-shelf/same-level bonuses from the
         # previous order's last completed task.
         self.last_completed_task = None
@@ -526,7 +565,11 @@ class TaskManager:
                 if task.metadata.get("search_mode")
                 and (observation := self.inventory_by_aruco.get(int(task.aruco_id))) is not None
                 and observation.get("confirmed")
-                and self._inventory_is_fresh(observation, now=now)
+                # PR3: identity (this tag IS this kind) is long-lived within
+                # the run - a slot already scanned must stay selectable after a
+                # delivery instead of expiring and forcing a full rescan.  The
+                # short-lived pose is re-acquired right before grasping.
+                and self._inventory_identity_fresh(observation, now=now)
                 and self.completed_counts[observation["kind"]] < self.requested_counts[observation["kind"]]
             ]
             if observed_matches:
@@ -853,7 +896,11 @@ class TaskManager:
         if age is None:
             freshness = 0.0
         else:
-            freshness = max(0.0, 1.0 - min(age, INVENTORY_MAX_AGE_SEC) / INVENTORY_MAX_AGE_SEC)
+            # PR3: score the pose freshness on the POSE scale (short-lived),
+            # so a slot whose identity is long-lived but whose pose went stale
+            # ranks lower (needs re-observe) but stays selectable.
+            pose_scale = max(0.001, INVENTORY_POSE_MAX_AGE_SEC)
+            freshness = max(0.0, 1.0 - min(age, pose_scale) / pose_scale)
         route_cost = self._estimate_roundtrip_cost(task)
         risk = self._task_risk(task)
         score = 100.0

@@ -135,6 +135,12 @@ class KeleDetectNode(Node):
             )
         self.aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
         self.aruco_params = cv2.aruco.DetectorParameters()
+        # PR2: sub-pixel corner refinement -> more stable marker centre and a
+        # better basis for the image-plane association and later PnP.
+        try:
+            self.aruco_params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+        except Exception:
+            pass
         self.aruco_detector = cv2.aruco.ArucoDetector(self.aruco_dict, self.aruco_params)
 
         # subscriptions
@@ -215,6 +221,41 @@ class KeleDetectNode(Node):
         valid = patch[patch > 0]
         return float(np.median(valid)) * 1e-3 if len(valid) else 0.0
 
+    @staticmethod
+    def robust_bbox_depth_m(depth_img, x0, y0, x1, y1, *, frac=0.4, depth_max=2.0):
+        """Robust surface depth over the CENTRAL region of a product box.
+
+        PR2: a single centre pixel often lands on packaging, the shelf board
+        behind the product, or a transparent edge.  We take the central
+        ``frac`` of the box, keep only valid depths under ``depth_max`` (drops
+        far background/shelf), then take the LOW percentile of the closest
+        surface cluster - i.e. the nearest solid surface, which is the product
+        face, not what is behind it.  Returns metres or 0.0 when unusable.
+        """
+        h, w = depth_img.shape[:2]
+        cx = (x0 + x1) / 2.0
+        cy = (y0 + y1) / 2.0
+        bw = max(4.0, x1 - x0)
+        bh = max(4.0, y1 - y0)
+        hw, hh = bw * frac / 2.0, bh * frac / 2.0
+        u0 = max(0, int(cx - hw))
+        u1 = min(w, int(cx + hw) + 1)
+        v0 = max(0, int(cy - hh))
+        v1 = min(h, int(cy + hh) + 1)
+        if u1 <= u0 or v1 <= v0:
+            return 0.0
+        region = depth_img[v0:v1, u0:u1].astype(np.float32)
+        valid = region[region > 0]
+        if len(valid) == 0:
+            return 0.0
+        # Metres; drop far background (shelf behind product).
+        valid_m = valid * 1e-3
+        valid_m = valid_m[valid_m < depth_max]
+        if len(valid_m) == 0:
+            return 0.0
+        # Nearest-surface cluster: low percentile of the near side.
+        return float(np.percentile(valid_m, 15))
+
     # ---- main RGB callback ----
     def rgb_cb(self, msg: Image):
         if self.K is None or self._depth_msg is None:
@@ -242,7 +283,12 @@ class KeleDetectNode(Node):
         vis = rgb.copy() if self.pub_res_img else rgb
         for det_index, d in enumerate(dets):
             u, v = int(d["x"]), int(d["y"])
-            depth_m = self.patch_depth_m(depth, u, v)
+            # PR2: use the central-box robust depth instead of a single-pixel
+            # patch (single pixel can hit packaging/shelf/transparent edge).
+            depth_m = self.robust_bbox_depth_m(
+                depth, int(d["x"]) - int(d["w"]) // 2, int(d["y"]) - int(d["h"]) // 2,
+                int(d["x"]) + int(d["w"]) // 2, int(d["y"]) + int(d["h"]) // 2,
+            )
             if depth_m <= 0.0:
                 continue
             p_cam = self.pixel_to_cam(u, v, depth_m)

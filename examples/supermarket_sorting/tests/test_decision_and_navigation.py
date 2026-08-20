@@ -503,6 +503,34 @@ class TaskManagerTests(unittest.TestCase):
             manager._inventory_candidate_score(task_stale, now=now),
         )
 
+    def test_pr3_identity_stays_selectable_after_pose_expires(self):
+        """PR3: identity (aruco->kind) is long-lived within the run; a slot
+        whose pose went stale stays selectable (re-observe before grasp)
+        instead of expiring and forcing a full rescan after a delivery."""
+        manager = TaskManager()
+        task = self._manual_search_task("search_id", 23, nav_x=0.70, nav_y=2.45)
+        manager.tasks = [task]
+        manager.requested_counts = Counter({"kele": 1})
+        now = time.time()
+        manager.inventory_by_aruco[23] = {
+            "kind": "kele",
+            "confidence": 0.9,
+            "world": (0.70, 2.45, 0.94),
+            "hits": 3,
+            "confirmed": True,
+            "state": "confirmed",
+            "first_seen": now - 30.0,
+            "last_seen": now - 30.0,
+            "fresh_at": now - 30.0,
+            "identity_seen_at": now - 30.0,
+            "pose_seen_at": now - 30.0,
+        }
+        # Pose is 30s stale (> pose age 12s) but identity is within the run.
+        self.assertFalse(manager._inventory_is_fresh(manager.inventory_by_aruco[23], now=now))
+        self.assertTrue(manager._inventory_identity_fresh(manager.inventory_by_aruco[23], now=now))
+        selected = manager.next_decision().selected_task
+        self.assertEqual(selected.aruco_id, 23)
+
     def test_inventory_scoring_honours_manual_reservation_bonus(self):
         manager = TaskManager()
         task_reserved = self._manual_search_task("search_reserved", 31, nav_x=0.90, nav_y=2.45)
