@@ -1737,3 +1737,14 @@ python -m unittest discover -s examples/supermarket_sorting/tests -p "test_*.py"
   - PLACE_X_OFFSETS=(0,0.12,0.24,0.12,0.24) 3 位置轮询（x 相邻错开）
   - 转身抬爪仅 test_oracle（visual）；headless 直接 DONE
 - 所有验证进程已停止、容器已清理。待后续验证：escape 补全后撞箱场景是否逃逸成功。
+
+## YOLO 9 类模型落地（2026-08-20）
+- 环境：server 容器（有 EGL 渲染，client 缺 EGL；server 同时具备 torch/ultralytics/cv2）
+- 数据：500 帧 × 2 = 1000 图 / 2053 框（本地 dataset/，E 盘 180GB 剩余，~100MB 富余）
+- 训练：YOLOv8n 20 epochs，val mAP50=0.989 / mAP50-95=0.918
+- 权重：perception/checkpoints/supermarket_multiclass.pt（21MB）
+  类别名 = [sanmingzhi,heweidao,shupian,zhijin,maidong,kele,kouxiangtang,pingguo,chengzi]（与官方 kind 一致）
+- 正式模式验证：官方匿名任务（只给 id+kind），SUPERMARKET_DETECT_BACKEND=yolo 感知节点
+  实际场景识别 zhijin（score 0.65-0.995）+ 世界坐标稳定输出
+- 注意：.pt 被 .gitignore 排除，团队需单独分发；数据未提交
+- 待办：ArUco 货位绑定 + 本局库存表 + 货架扫描策略（阶段1）

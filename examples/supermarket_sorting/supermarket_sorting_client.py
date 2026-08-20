@@ -139,7 +139,7 @@ CREEP_STOP_DY = 0.0
 # gives a stable reachable kele point.
 DETECT_DWELL = 0.6                # s to let head settle + detections accumulate before locking
 DETECT_TIMEOUT = float(os.getenv("SUPERMARKET_DETECT_TIMEOUT", "10.0"))
-SEARCH_DETECT_TIMEOUT = float(os.getenv("SUPERMARKET_SEARCH_DETECT_TIMEOUT", "2.5"))
+SEARCH_DETECT_TIMEOUT = float(os.getenv("SUPERMARKET_SEARCH_DETECT_TIMEOUT", "12.0"))
 # A CUDA YOLO process may take several seconds to construct its model after the
 # decision node starts.  An anonymous task must never interpret that startup
 # window as an empty shelf slot and begin retrying/turning beside the rack.
