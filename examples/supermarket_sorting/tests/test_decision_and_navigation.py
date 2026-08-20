@@ -1322,6 +1322,10 @@ class NavigationTests(unittest.TestCase):
         client.crumb_trail = [(0.0, 2.2, 1.57), (0.0, 1.7, 1.57), (0.0, 1.3, 1.57)]
         client.crumb_target = None
         client.crumb_back_until = 0.0
+        client.scan_ranges = None
+        client.scan_stamp = 0.0
+        client.scan_angle_min = 0.0
+        client.scan_angle_increment = 0.0
         target = np.array([1.0, 2.5], dtype=float)
 
         triggered = client_mod.PickPlaceClient.maybe_start_stuck_recovery(client, target)

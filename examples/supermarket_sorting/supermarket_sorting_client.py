@@ -4415,6 +4415,30 @@ class PickPlaceClient(Node):
         if self.nav_recovery_count > MAX_NAV_RECOVERIES:
             self.fail_current_execution("navigation recovery limit exceeded")
             return True
+        # Record the blocker into persistent obstacles so the replan actually
+        # routes AROUND it (round 61c: without this, escape + replan drove
+        # straight back into the same box 8 times and the base never escaped).
+        if self.scan_ranges is not None and self.now() - self.scan_stamp <= SCAN_STALE_TIMEOUT:
+            try:
+                angles = self.scan_angle_min + np.arange(len(self.scan_ranges)) * self.scan_angle_increment
+                valid = np.isfinite(self.scan_ranges) & (self.scan_ranges > 0.12) & (self.scan_ranges < 1.5)
+                if np.any(valid):
+                    lidar_origin = np.asarray(self.base_xy, dtype=float) + LIDAR_FORWARD_OFFSET * np.array(
+                        [math.cos(self.base_yaw), math.sin(self.base_yaw)])
+                    persistent = getattr(self, "persistent_obstacles", None)
+                    if persistent is None:
+                        self.persistent_obstacles = []
+                        persistent = self.persistent_obstacles
+                    for ang, rng in zip(angles[valid], self.scan_ranges[valid]):
+                        hit = (float(lidar_origin[0] + rng * math.cos(self.base_yaw + ang)),
+                               float(lidar_origin[1] + rng * math.sin(self.base_yaw + ang)))
+                        if not any(float(np.linalg.norm(np.asarray(old) - np.asarray(hit))) < 0.30
+                                   for old in persistent):
+                            persistent.append(hit)
+                        if len(persistent) >= 120:
+                            break
+            except Exception:
+                pass
         # Breadcrumb backtracking: when a dead end is reached (we have crumbs
         # behind us), walk BACK along the safe trail to the nearest node
         # instead of reversing blindly / turning in place (round 61: the old
@@ -4540,10 +4564,12 @@ class PickPlaceClient(Node):
         if self.nav_idx < len(route):
             # Breadcrumb trail for dead-end backtracking: record a safe pose
             # every CRUMB_SPACING metres while driving normally (not during a
-            # recovery motion, which may itself be backing away).
+            # recovery motion, which may itself be backing away).  Round 61c:
+            # do NOT require nav_mode == "drive" - the shelf-return leg spends
+            # most of its time in "turn" mode, so the old condition recorded
+            # almost nothing and dead-end backtracking had no crumbs to use.
             if (
                 self.recovery_state == "idle"
-                and self.nav_mode == "drive"
                 and self.base_xy is not None
             ):
                 trail = getattr(self, "crumb_trail", None)
