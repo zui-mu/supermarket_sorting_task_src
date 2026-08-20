@@ -632,7 +632,7 @@ class NavigationTests(unittest.TestCase):
             "geometry_msgs.msg": types.SimpleNamespace(Twist=object),
             "std_msgs.msg": types.SimpleNamespace(Float64MultiArray=object, String=object),
             "nav_msgs.msg": types.SimpleNamespace(Odometry=object),
-            "sensor_msgs.msg": types.SimpleNamespace(Image=object, JointState=object, LaserScan=object),
+            "sensor_msgs.msg": types.SimpleNamespace(Image=object, JointState=object, LaserScan=object, CameraInfo=object),
             "std_srvs.srv": types.SimpleNamespace(Trigger=object),
             "vision_msgs.msg": types.SimpleNamespace(Detection3DArray=object),
             "discoverse.utils": types.SimpleNamespace(step_func=lambda *args, **kwargs: None),
@@ -670,7 +670,7 @@ class NavigationTests(unittest.TestCase):
             "geometry_msgs.msg": types.SimpleNamespace(Twist=object),
             "std_msgs.msg": types.SimpleNamespace(Float64MultiArray=object, String=object),
             "nav_msgs.msg": types.SimpleNamespace(Odometry=object),
-            "sensor_msgs.msg": types.SimpleNamespace(Image=object, JointState=object, LaserScan=object),
+            "sensor_msgs.msg": types.SimpleNamespace(Image=object, JointState=object, LaserScan=object, CameraInfo=object),
             "std_srvs.srv": types.SimpleNamespace(Trigger=object),
             "vision_msgs.msg": types.SimpleNamespace(Detection3DArray=object),
             "discoverse.utils": types.SimpleNamespace(step_func=lambda *args, **kwargs: None),
@@ -792,7 +792,7 @@ class NavigationTests(unittest.TestCase):
             "geometry_msgs.msg": types.SimpleNamespace(Twist=object),
             "std_msgs.msg": types.SimpleNamespace(Float64MultiArray=object, String=object),
             "nav_msgs.msg": types.SimpleNamespace(Odometry=object),
-            "sensor_msgs.msg": types.SimpleNamespace(Image=object, JointState=object, LaserScan=object),
+            "sensor_msgs.msg": types.SimpleNamespace(Image=object, JointState=object, LaserScan=object, CameraInfo=object),
             "std_srvs.srv": types.SimpleNamespace(Trigger=object),
             "vision_msgs.msg": types.SimpleNamespace(Detection3DArray=object),
             "discoverse.utils": types.SimpleNamespace(step_func=lambda *args, **kwargs: None),
@@ -894,7 +894,7 @@ class NavigationTests(unittest.TestCase):
             "geometry_msgs.msg": types.SimpleNamespace(Twist=object),
             "std_msgs.msg": types.SimpleNamespace(Float64MultiArray=object, String=object),
             "nav_msgs.msg": types.SimpleNamespace(Odometry=object),
-            "sensor_msgs.msg": types.SimpleNamespace(Image=object, JointState=object, LaserScan=object),
+            "sensor_msgs.msg": types.SimpleNamespace(Image=object, JointState=object, LaserScan=object, CameraInfo=object),
             "std_srvs.srv": types.SimpleNamespace(Trigger=object),
             "vision_msgs.msg": types.SimpleNamespace(Detection3DArray=object),
             "discoverse.utils": types.SimpleNamespace(step_func=lambda *args, **kwargs: None),
@@ -955,7 +955,7 @@ class NavigationTests(unittest.TestCase):
             "geometry_msgs.msg": types.SimpleNamespace(Twist=object),
             "std_msgs.msg": types.SimpleNamespace(Float64MultiArray=object, String=object),
             "nav_msgs.msg": types.SimpleNamespace(Odometry=object),
-            "sensor_msgs.msg": types.SimpleNamespace(Image=object, JointState=object, LaserScan=object),
+            "sensor_msgs.msg": types.SimpleNamespace(Image=object, JointState=object, LaserScan=object, CameraInfo=object),
             "std_srvs.srv": types.SimpleNamespace(Trigger=object),
             "vision_msgs.msg": types.SimpleNamespace(Detection3DArray=object),
             "discoverse.utils": types.SimpleNamespace(step_func=lambda *args, **kwargs: None),
@@ -1005,7 +1005,7 @@ class NavigationTests(unittest.TestCase):
             "geometry_msgs.msg": types.SimpleNamespace(Twist=object),
             "std_msgs.msg": types.SimpleNamespace(Float64MultiArray=object, String=object),
             "nav_msgs.msg": types.SimpleNamespace(Odometry=object),
-            "sensor_msgs.msg": types.SimpleNamespace(Image=object, JointState=object, LaserScan=object),
+            "sensor_msgs.msg": types.SimpleNamespace(Image=object, JointState=object, LaserScan=object, CameraInfo=object),
             "std_srvs.srv": types.SimpleNamespace(Trigger=object),
             "vision_msgs.msg": types.SimpleNamespace(Detection3DArray=object),
             "discoverse.utils": types.SimpleNamespace(step_func=lambda *args, **kwargs: None),
@@ -1064,7 +1064,7 @@ class NavigationTests(unittest.TestCase):
             "geometry_msgs.msg": types.SimpleNamespace(Twist=object),
             "std_msgs.msg": types.SimpleNamespace(Float64MultiArray=object, String=object),
             "nav_msgs.msg": types.SimpleNamespace(Odometry=object),
-            "sensor_msgs.msg": types.SimpleNamespace(Image=object, JointState=object, LaserScan=object),
+            "sensor_msgs.msg": types.SimpleNamespace(Image=object, JointState=object, LaserScan=object, CameraInfo=object),
             "std_srvs.srv": types.SimpleNamespace(Trigger=object),
             "vision_msgs.msg": types.SimpleNamespace(Detection3DArray=object),
             "discoverse.utils": types.SimpleNamespace(step_func=lambda *args, **kwargs: None),
@@ -1103,7 +1103,7 @@ class NavigationTests(unittest.TestCase):
             "geometry_msgs.msg": types.SimpleNamespace(Twist=object),
             "std_msgs.msg": types.SimpleNamespace(Float64MultiArray=object, String=object),
             "nav_msgs.msg": types.SimpleNamespace(Odometry=object),
-            "sensor_msgs.msg": types.SimpleNamespace(Image=object, JointState=object, LaserScan=object),
+            "sensor_msgs.msg": types.SimpleNamespace(Image=object, JointState=object, LaserScan=object, CameraInfo=object),
             "std_srvs.srv": types.SimpleNamespace(Trigger=object),
             "vision_msgs.msg": types.SimpleNamespace(Detection3DArray=object),
             "discoverse.utils": types.SimpleNamespace(step_func=lambda *args, **kwargs: None),
@@ -1142,7 +1142,7 @@ class NavigationTests(unittest.TestCase):
             "geometry_msgs.msg": types.SimpleNamespace(Twist=object),
             "std_msgs.msg": types.SimpleNamespace(Float64MultiArray=object, String=object),
             "nav_msgs.msg": types.SimpleNamespace(Odometry=object),
-            "sensor_msgs.msg": types.SimpleNamespace(Image=object, JointState=object, LaserScan=object),
+            "sensor_msgs.msg": types.SimpleNamespace(Image=object, JointState=object, LaserScan=object, CameraInfo=object),
             "std_srvs.srv": types.SimpleNamespace(Trigger=object),
             "vision_msgs.msg": types.SimpleNamespace(Detection3DArray=object),
             "discoverse.utils": types.SimpleNamespace(step_func=lambda *args, **kwargs: None),
@@ -1171,7 +1171,7 @@ class NavigationTests(unittest.TestCase):
             "geometry_msgs.msg": types.SimpleNamespace(Twist=object),
             "std_msgs.msg": types.SimpleNamespace(Float64MultiArray=object, String=object),
             "nav_msgs.msg": types.SimpleNamespace(Odometry=object),
-            "sensor_msgs.msg": types.SimpleNamespace(Image=object, JointState=object, LaserScan=object),
+            "sensor_msgs.msg": types.SimpleNamespace(Image=object, JointState=object, LaserScan=object, CameraInfo=object),
             "std_srvs.srv": types.SimpleNamespace(Trigger=object),
             "vision_msgs.msg": types.SimpleNamespace(Detection3DArray=object),
             "discoverse.utils": types.SimpleNamespace(step_func=lambda *args, **kwargs: None),
@@ -1200,7 +1200,7 @@ class NavigationTests(unittest.TestCase):
             "geometry_msgs.msg": types.SimpleNamespace(Twist=object),
             "std_msgs.msg": types.SimpleNamespace(Float64MultiArray=object, String=object),
             "nav_msgs.msg": types.SimpleNamespace(Odometry=object),
-            "sensor_msgs.msg": types.SimpleNamespace(Image=object, JointState=object, LaserScan=object),
+            "sensor_msgs.msg": types.SimpleNamespace(Image=object, JointState=object, LaserScan=object, CameraInfo=object),
             "std_srvs.srv": types.SimpleNamespace(Trigger=object),
             "vision_msgs.msg": types.SimpleNamespace(Detection3DArray=object),
             "discoverse.utils": types.SimpleNamespace(step_func=lambda *args, **kwargs: None),
@@ -1250,7 +1250,7 @@ class NavigationTests(unittest.TestCase):
             "geometry_msgs.msg": types.SimpleNamespace(Twist=object),
             "std_msgs.msg": types.SimpleNamespace(Float64MultiArray=object, String=object),
             "nav_msgs.msg": types.SimpleNamespace(Odometry=object),
-            "sensor_msgs.msg": types.SimpleNamespace(Image=object, JointState=object, LaserScan=object),
+            "sensor_msgs.msg": types.SimpleNamespace(Image=object, JointState=object, LaserScan=object, CameraInfo=object),
             "std_srvs.srv": types.SimpleNamespace(Trigger=object),
             "vision_msgs.msg": types.SimpleNamespace(Detection3DArray=object),
             "discoverse.utils": types.SimpleNamespace(step_func=lambda *args, **kwargs: None),
@@ -1279,6 +1279,60 @@ class NavigationTests(unittest.TestCase):
         self.assertGreaterEqual(travel, client_mod.PLACE_REVERSE_DISTANCE)
         self.assertTrue(done)
 
+    def test_stuck_recovery_prefers_crumb_backtracking(self):
+        """Round 61: with a safe breadcrumb trail behind, a stall must walk
+        BACK to the nearest crumb (crumb_back) instead of blindly reversing."""
+        fake_modules = {
+            "rclpy": types.SimpleNamespace(init=lambda: None, spin=lambda node: None, ok=lambda: False, shutdown=lambda: None),
+            "rclpy.node": types.SimpleNamespace(Node=object),
+            "geometry_msgs.msg": types.SimpleNamespace(Twist=object),
+            "std_msgs.msg": types.SimpleNamespace(Float64MultiArray=object, String=object),
+            "nav_msgs.msg": types.SimpleNamespace(Odometry=object),
+            "sensor_msgs.msg": types.SimpleNamespace(Image=object, JointState=object, LaserScan=object, CameraInfo=object),
+            "std_srvs.srv": types.SimpleNamespace(Trigger=object),
+            "vision_msgs.msg": types.SimpleNamespace(Detection3DArray=object),
+            "discoverse.utils": types.SimpleNamespace(step_func=lambda *args, **kwargs: None),
+            "mmk2_kdl": types.SimpleNamespace(MMK2Kdl=object),
+            "perception.backends": types.SimpleNamespace(stable_class_consensus=lambda *args, **kwargs: None),
+            "navigation.grid_planner": types.SimpleNamespace(SupermarketGridPlanner=SupermarketGridPlanner),
+        }
+        with mock.patch.dict(sys.modules, fake_modules):
+            import importlib
+
+            client_mod = importlib.import_module("supermarket_sorting_client")
+
+        client = object.__new__(client_mod.PickPlaceClient)
+        client.nav_mode = "drive"
+        client.phase = client_mod.NAV_SHELF
+        client.base_xy = np.array([-0.5, 1.0], dtype=float)
+        client.nav_idx = 1
+        client.route_to_shelf = [[1.0, 2.5]]
+        client.now = lambda: 200.0
+        client.front_blocked = False
+        client.get_logger = lambda: types.SimpleNamespace(
+            info=lambda *args, **kwargs: None,
+            warn=lambda *args, **kwargs: None,
+        )
+        # A stall: last progress was the same pose a while ago.
+        client.last_nav_progress_xy = np.array([-0.5, 1.0], dtype=float)
+        client.last_nav_progress_time = 190.0
+        client.nav_recovery_count = 1
+        client.recovery_escape = False
+        client._nav_waypoint_deadline = 0.0
+        client.crumb_trail = [(0.0, 2.2, 1.57), (0.0, 1.7, 1.57), (0.0, 1.3, 1.57)]
+        client.crumb_target = None
+        client.crumb_back_until = 0.0
+        target = np.array([1.0, 2.5], dtype=float)
+
+        triggered = client_mod.PickPlaceClient.maybe_start_stuck_recovery(client, target)
+        self.assertTrue(triggered)
+        self.assertEqual(client.recovery_state, "crumb_back")
+        self.assertIsNotNone(client.crumb_target)
+        # The nearest crumb (last travelled node, behind the current pose) is
+        # the backtrack target.
+        self.assertAlmostEqual(client.crumb_target[0], 0.0)
+        self.assertAlmostEqual(client.crumb_target[1], 1.3)
+
     def test_startup_clearance_stows_before_straight_exit_without_yaw(self):
         """The right-wall spawn may not enter route-turn control with a moving arm."""
         fake_modules = {
@@ -1287,7 +1341,7 @@ class NavigationTests(unittest.TestCase):
             "geometry_msgs.msg": types.SimpleNamespace(Twist=object),
             "std_msgs.msg": types.SimpleNamespace(Float64MultiArray=object, String=object),
             "nav_msgs.msg": types.SimpleNamespace(Odometry=object),
-            "sensor_msgs.msg": types.SimpleNamespace(Image=object, JointState=object, LaserScan=object),
+            "sensor_msgs.msg": types.SimpleNamespace(Image=object, JointState=object, LaserScan=object, CameraInfo=object),
             "std_srvs.srv": types.SimpleNamespace(Trigger=object),
             "vision_msgs.msg": types.SimpleNamespace(Detection3DArray=object),
             "discoverse.utils": types.SimpleNamespace(step_func=lambda *args, **kwargs: None),

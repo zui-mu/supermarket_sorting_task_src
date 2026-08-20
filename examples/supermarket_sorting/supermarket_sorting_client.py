@@ -17,6 +17,18 @@ import math
 import os
 import json
 import numpy as np
+
+# Wrist visual servoing (round 61): the right-wrist camera sits between the
+# fingers; when enabled we use it to centre the target on the finger mid-line
+# during the final creep instead of trusting only the head-based estimate.
+# cv2 is present in the container but not in the unit-test environment, so
+# import it defensively and degrade to geometry-only when unavailable.
+try:
+    import cv2
+    _CV2_AVAILABLE = True
+except Exception:  # pragma: no cover - container always has cv2
+    cv2 = None
+    _CV2_AVAILABLE = False
 from scipy.spatial.transform import Rotation
 
 import rclpy
@@ -26,7 +38,7 @@ from std_msgs.msg import Float64MultiArray, String
 from collections import deque
 
 from nav_msgs.msg import Odometry
-from sensor_msgs.msg import Image, JointState, LaserScan
+from sensor_msgs.msg import Image, JointState, LaserScan, CameraInfo
 from std_srvs.srv import Trigger
 from vision_msgs.msg import Detection3DArray
 
@@ -393,6 +405,21 @@ STUCK_RECOVERY_TIME = float(os.getenv("SUPERMARKET_STUCK_RECOVERY_TIME", "1.8"))
 STUCK_ESCAPE_THRESHOLD = int(os.getenv("SUPERMARKET_STUCK_ESCAPE_THRESHOLD", "3"))
 STUCK_ESCAPE_REVERSE_TIME = float(os.getenv("SUPERMARKET_STUCK_ESCAPE_REVERSE_TIME", "6.0"))
 STUCK_ESCAPE_SPEED = float(os.getenv("SUPERMARKET_STUCK_ESCAPE_SPEED", "0.22"))
+# Breadcrumb backtracking (round 61): the base records a safe pose every
+# CRUMB_SPACING metres while driving.  When stuck in a dead end, recovery
+# walks BACK along the crumbs to the nearest safe node instead of blindly
+# reversing/turning in place (the old behaviour re-faced the pinned box and
+# the contact area only grew).  This is the "retreat to the parent node"
+# idea the audit requested.
+CRUMB_SPACING = float(os.getenv("SUPERMARKET_CRUMB_SPACING", "0.25"))
+CRUMB_MAX = int(os.getenv("SUPERMARKET_CRUMB_MAX", "60"))
+CRUMB_BACK_TIMEOUT = float(os.getenv("SUPERMARKET_CRUMB_BACK_TIMEOUT", "12.0"))
+CRUMB_BACK_REACH = float(os.getenv("SUPERMARKET_CRUMB_BACK_REACH", "0.15"))
+# Wrist visual servoing: estimated target distance from the wrist camera at
+# the close moment (the bottle is ~0.2-0.3 m ahead of the fingers during
+# creep).  Used only to scale pixel offset to metres; the control gain is
+# modest so an inaccurate estimate cannot destabilise the creep.
+WRIST_DEPTH_EST = float(os.getenv("SUPERMARKET_WRIST_DEPTH_EST", "0.25"))
 GRASP_VERIFY_TIMEOUT = float(os.getenv("SUPERMARKET_GRASP_VERIFY_TIMEOUT", "5.0"))
 # VERIFY_GRASP 的直线倒车没有导航恢复机制, 加一个独立的停滞超时兜底。
 VERIFY_RETREAT_TIMEOUT = float(os.getenv("SUPERMARKET_VERIFY_RETREAT_TIMEOUT", "14.0"))
@@ -1235,6 +1262,8 @@ class PickPlaceClient(Node):
         self.verify_start_xy = None
         self.verify_retreat_started_at = None
         self.verify_retreat_start_xy = None
+        # Session-persistent obstacle memory for A* (whole-match).
+        self.persistent_obstacles = []
         self.table_s4_wait_since = None
         self.referee_state = {}
         self.test_oracle_enabled = TEST_ORACLE_ENABLED
@@ -1385,6 +1414,21 @@ class PickPlaceClient(Node):
         self.create_subscription(Detection3DArray, DETECTIONS_TOPIC, self.det_cb, 10)
         self.create_subscription(LaserScan, "/slamware_ros_sdk_server_node/scan", self.scan_cb, 5)
         self.create_subscription(Image, "/head_camera/aligned_depth_to_color/image_raw", self.depth_safety_cb, 5)
+        # Wrist visual servoing (round 61): right-wrist RGB only (no wrist
+        # depth stream exists).  The wrist camera sits between the fingers;
+        # its image tells us whether the target is centred on the finger
+        # mid-line during the final creep.  Only active when cv2 is available
+        # and the server renders all cameras.
+        self.wrist_enabled = bool(
+            _CV2_AVAILABLE and os.getenv("SUPERMARKET_WRIST_SERVO", "0") == "1")
+        self.wrist_px = None            # (u, v) target centre in wrist image
+        self.wrist_stamp = 0.0
+        self.wrist_fx = 640.0
+        self.wrist_cx = 320.0
+        self.wrist_servo_active = False
+        if self.wrist_enabled:
+            self.create_subscription(Image, "/right_camera/color/image_raw", self.wrist_image_cb, 4)
+            self.create_subscription(CameraInfo, "/right_camera/color/camera_info", self.wrist_info_cb, 4)
         # Always subscribe to /referee/state.  In formal runs the official
         # referee is the only S5 authority, and the placement open-confirm
         # timeout uses referee "completed" as a release proof (v40 fix for
@@ -2237,11 +2281,82 @@ class PickPlaceClient(Node):
                 f"age={self.now() - self.scan_stamp:.3f}s "
                 f"memory={len(self.obstacle_memory)}")
 
+    def wrist_image_cb(self, msg):
+        """Detect the target centre in the right-wrist camera (colour blob).
+
+        The bottle is a red cylinder; HSV red segmentation is simple and
+        robust in this sim.  The target's horizontal offset from the image
+        centre (which projects to the finger mid-line) is the lateral error
+        for the final centring before closing.
+        """
+        if not self.wrist_enabled or msg.height <= 0 or msg.width <= 0 or not msg.data:
+            return
+        try:
+            if msg.encoding.lower().find("bgr") >= 0 or msg.encoding.lower() == "rgb8":
+                arr = np.frombuffer(msg.data, dtype=np.uint8)
+                arr = arr.reshape((msg.height, msg.width, 3))
+                if msg.encoding.lower() == "rgb8":
+                    bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+                else:
+                    bgr = arr
+            elif msg.encoding.lower() == "mono8":
+                return
+            else:
+                return
+            hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+            # Red wraps around hue 0: two masks.
+            mask1 = cv2.inRange(hsv, (0, 90, 70), (12, 255, 255))
+            mask2 = cv2.inRange(hsv, (168, 90, 70), (180, 255, 255))
+            mask = cv2.bitwise_or(mask1, mask2)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if not contours:
+                self.wrist_px = None
+                return
+            big = max(contours, key=cv2.contourArea)
+            if cv2.contourArea(big) < 40.0:
+                self.wrist_px = None
+                return
+            m = cv2.moments(big)
+            if m["m00"] <= 0:
+                self.wrist_px = None
+                return
+            u = float(m["m10"] / m["m00"])
+            v = float(m["m01"] / m["m00"])
+            self.wrist_px = (u, v)
+            self.wrist_stamp = self.now()
+        except Exception:
+            self.wrist_px = None
+
+    def wrist_info_cb(self, msg):
+        """Store the wrist camera intrinsics."""
+        try:
+            if msg.k and len(msg.k) >= 3:
+                self.wrist_fx = float(msg.k[0])
+                self.wrist_cx = float(msg.k[2])
+        except Exception:
+            pass
+
+    def wrist_lateral_error_m(self):
+        """Estimated lateral offset (m) of the target from the finger mid-line.
+
+        The wrist camera projects to the finger mid-line at the image centre.
+        A target at pixel u sits (u - cx)/fx radians off-axis; at the grasp
+        distance (est ~0.25 m) that is roughly (u - cx)/fx * depth.  Returns
+        None when no valid recent detection exists.
+        """
+        if not self.wrist_enabled or self.wrist_px is None:
+            return None
+        if self.now() - self.wrist_stamp > 0.5:
+            self.wrist_px = None
+            return None
+        u, _ = self.wrist_px
+        return float((u - self.wrist_cx) / self.wrist_fx * WRIST_DEPTH_EST)
+
     def depth_safety_cb(self, msg):
         """Extract robust left/front/right ranges from common ROS depth encodings."""
         if msg.height <= 0 or msg.width <= 0 or not msg.data:
-            return
-        # Full-frame decoding plus three percentile passes is the heaviest
+            return        # Full-frame decoding plus three percentile passes is the heaviest
         # callback on the single-threaded executor. The safety consumers only
         # need ~10 Hz (their freshness window is 0.5 s); drop the rest so the
         # 50 Hz control tick is never starved by the image pipeline.
@@ -2390,6 +2505,11 @@ class PickPlaceClient(Node):
         self.active_task = task
         self.active_product_name = str(getattr(task, "product_name", "kele"))
         self.active_task_level = str(getattr(task, "level", "L2"))
+        # New task: reset the breadcrumb trail (the safe path of the previous
+        # task is not valid for the new one).
+        self.crumb_trail = []
+        self.crumb_target = None
+        self.crumb_back_until = 0.0
         self.grasp_profile = self.profile_for_task(task)
         self.grasp_rot = self.grasp_rotation_for_task(task)
         self.right_arm_top_box_post_blocked = requires_mirrored_left_arm(task)
@@ -3394,6 +3514,10 @@ class PickPlaceClient(Node):
         A single scan can momentarily miss a cardboard box while the robot is
         turning.  Keeping a short, bounded memory lets A* route around the
         observed obstacle instead of immediately planning back through it.
+        Round 61: session-persistent obstacles (boxes that actually blocked
+        the robot) are merged in, so a box met earlier in the match is still
+        avoided on a later trip instead of being forgotten after a few
+        seconds (the audit's "persistent costmap" request, simplified).
         """
         now = self.now()
         # The scan_cb maintains the world-frame memory per scan (multi-scan
@@ -3402,6 +3526,9 @@ class PickPlaceClient(Node):
         while self.obstacle_memory and now - self.obstacle_memory[0][0] > LIDAR_OBSTACLE_MEMORY_SEC:
             self.obstacle_memory.popleft()
         points = [point for _, point in self.obstacle_memory]
+        persistent = getattr(self, "persistent_obstacles", None) or []
+        if persistent:
+            points = points + list(persistent)
         if points and self.base_xy is not None:
             arr = np.asarray(points, dtype=float)
             keep = np.linalg.norm(arr - np.asarray(self.base_xy, dtype=float), axis=1) < max_range
@@ -3747,6 +3874,38 @@ class PickPlaceClient(Node):
             and self.now() - self.front_blocked_since >= (0.35 if self.phase == NAV_SHELF else 0.40)
         )
         if self.front_blocked:
+            # Session-persistent obstacle: the closest lidar hit ahead IS the
+            # blocker.  Upsert it into persistent_obstacles so A* still avoids
+            # this spot on later trips even after the short scan memory fades.
+            if self.scan_ranges is not None and self.now() - self.scan_stamp <= SCAN_STALE_TIMEOUT:
+                try:
+                    angles = self.scan_angle_min + np.arange(len(self.scan_ranges)) * self.scan_angle_increment
+                    valid = np.isfinite(self.scan_ranges) & (self.scan_ranges > 0.12) & (self.scan_ranges < 1.2)
+                    if np.any(valid):
+                        front_mask = valid & (np.abs(angles) <= 0.35)
+                        if np.any(front_mask):
+                            idx = int(np.argmin(self.scan_ranges[front_mask]))
+                            ang = float(angles[front_mask][idx])
+                            rng = float(self.scan_ranges[front_mask][idx])
+                            lidar_origin = np.asarray(self.base_xy, dtype=float) + LIDAR_FORWARD_OFFSET * np.array(
+                                [math.cos(self.base_yaw), math.sin(self.base_yaw)])
+                            hit = (float(lidar_origin[0] + rng * math.cos(self.base_yaw + ang)),
+                                   float(lidar_origin[1] + rng * math.sin(self.base_yaw + ang)))
+                            persistent = getattr(self, "persistent_obstacles", None)
+                            if persistent is None:
+                                self.persistent_obstacles = []
+                                persistent = self.persistent_obstacles
+                            # Upsert: replace a nearby remembered point.
+                            replaced = False
+                            for i, old in enumerate(persistent):
+                                if float(np.linalg.norm(np.asarray(old) - np.asarray(hit))) < 0.30:
+                                    persistent[i] = hit
+                                    replaced = True
+                                    break
+                            if not replaced and len(persistent) < 60:
+                                persistent.append(hit)
+                except Exception:
+                    pass
             turn_sign = 1.0 if left >= right else -1.0
             self.des_lin = 0.0
             self.des_ang = 0.0
@@ -4026,6 +4185,49 @@ class PickPlaceClient(Node):
                     self.route_needs_plan = True
                 self.set_twist(0.0, 0.0)
                 return False
+        if self.recovery_state == "crumb_back":
+            # Drive BACKWARDS along the safe breadcrumb trail to the target
+            # node (the nearest safe pose we actually travelled through).
+            if self.crumb_target is None or self.now() >= self.crumb_back_until:
+                # No target or timed out: fall through to the normal reverse
+                # recovery so the flow cannot stall here.
+                self.recovery_state = "reverse"
+                self.recovery_linear = -0.18
+                self.recovery_until = self.now() + STUCK_RECOVERY_TIME
+                self.crumb_target = None
+                return True
+            delta = self.crumb_target - np.asarray(self.base_xy, dtype=float)
+            dist = float(np.linalg.norm(delta))
+            if dist < CRUMB_BACK_REACH:
+                # Reached the safe node: drop this crumb and replan from here.
+                if self.crumb_trail:
+                    self.crumb_trail = self.crumb_trail[:-1]
+                self.crumb_target = None
+                self.recovery_state = "idle"
+                self.recovery_until = 0.0
+                self.last_nav_progress_xy = np.array(self.base_xy, dtype=float)
+                self.last_nav_progress_time = self.now()
+                self.nav_mode = "turn"
+                if self.phase == NAV_TABLE:
+                    self.route_goal = self.delivery_goal_current.copy()
+                    self.route_purpose = "delivery"
+                    self.route_needs_plan = True
+                else:
+                    self.route_needs_plan = True
+                self.set_twist(0.0, 0.0)
+                self.get_logger().warn(
+                    f"[nav_recovery] reached safe crumb "
+                    f"({self.base_xy[0]:.2f},{self.base_xy[1]:.2f}); replanning")
+                return False
+            # Face the crumb by reversing: robot faces away, so steering yaw
+            # error is measured against the reverse heading (base_yaw + pi).
+            yaw_to = math.atan2(delta[1], delta[0])
+            yaw_err = wrap_to_pi(yaw_to - (float(self.base_yaw) + math.pi))
+            ang = float(np.clip(0.8 * yaw_err, -0.45, 0.45))
+            self.set_twist(-0.18, ang)
+            if self.grasp_was_confirmed and self.loaded_carry_hold is not None and self.phase == NAV_TABLE:
+                self.hold_loaded_carry_pose(hold_slide=not self.place_pre_raise_active, hold_gripper=True, hold_right_arm=not self.loaded_arm_moving)
+            return True
         if self.recovery_state == "reverse":
             if self.rear_blocked_now():
                 if not getattr(self, "recovery_escape", False):
@@ -4213,6 +4415,27 @@ class PickPlaceClient(Node):
         if self.nav_recovery_count > MAX_NAV_RECOVERIES:
             self.fail_current_execution("navigation recovery limit exceeded")
             return True
+        # Breadcrumb backtracking: when a dead end is reached (we have crumbs
+        # behind us), walk BACK along the safe trail to the nearest node
+        # instead of reversing blindly / turning in place (round 61: the old
+        # behaviour re-faced the pinned box and the contact area only grew).
+        # This is tried FIRST on every stall; the reverse/escape paths remain
+        # as fallbacks when no trail exists (e.g. right after a task reset).
+        trail = getattr(self, "crumb_trail", None) or []
+        if trail:
+            crumb = trail[-1]
+            dist_to_crumb = float(np.linalg.norm(
+                np.asarray(crumb[:2], dtype=float) - np.asarray(self.base_xy, dtype=float)))
+            if dist_to_crumb > CRUMB_BACK_REACH:
+                self.recovery_state = "crumb_back"
+                self.crumb_target = np.array(crumb[:2], dtype=float)
+                self.crumb_back_until = now + CRUMB_BACK_TIMEOUT
+                self.recovery_escape = False
+                self.get_logger().warn(
+                    f"[nav_recovery] dead end; backtracking to safe crumb "
+                    f"({crumb[0]:.2f},{crumb[1]:.2f}) "
+                    f"(recovery {self.nav_recovery_count}/{MAX_NAV_RECOVERIES})")
+                return True
         self.recovery_state = "reverse"
         escape = self.nav_recovery_count >= STUCK_ESCAPE_THRESHOLD
         self.recovery_escape = escape
@@ -4315,6 +4538,25 @@ class PickPlaceClient(Node):
                     if planned:
                         route[:] = planned
         if self.nav_idx < len(route):
+            # Breadcrumb trail for dead-end backtracking: record a safe pose
+            # every CRUMB_SPACING metres while driving normally (not during a
+            # recovery motion, which may itself be backing away).
+            if (
+                self.recovery_state == "idle"
+                and self.nav_mode == "drive"
+                and self.base_xy is not None
+            ):
+                trail = getattr(self, "crumb_trail", None)
+                if trail is None:
+                    self.crumb_trail = []
+                    trail = self.crumb_trail
+                if (not trail or float(np.linalg.norm(
+                        np.asarray(self.base_xy, dtype=float) - np.asarray(trail[-1][:2])
+                )) >= CRUMB_SPACING):
+                    trail.append((
+                        float(self.base_xy[0]), float(self.base_xy[1]), float(self.base_yaw)))
+                    if len(trail) > CRUMB_MAX:
+                        del trail[0]
             # Waypoint driving supersedes the final-alignment watchdog state.
             self.final_turn_progress_yaw = None
             target = self.clamp_nav_target(np.array(route[self.nav_idx], dtype=float))
@@ -4750,6 +4992,11 @@ class PickPlaceClient(Node):
         self.recovery_escape = False
         self.recovery_turn_target_yaw = None
         self.recovery_turn_start_yaw = None
+        # NOTE: crumb_trail is NOT cleared here; it must survive per-route
+        # resets within a task so dead-end backtracking can walk back along
+        # the whole task route.  It is cleared when a new task is applied.
+        self.crumb_target = None
+        self.crumb_back_until = 0.0
         self.nav_recovery_count = 0
         self.front_blocked = False
         self.front_blocked_since = None
@@ -5447,8 +5694,23 @@ class PickPlaceClient(Node):
                     # touch).  The correction below is already scaled to
                     # atan2(lateral, remaining); this cap only limits its size.
                     max_correction = min(max_correction, 0.008)
+                # Wrist visual servoing (round 61): once the bottle enters the
+                # right-wrist camera's field (close range), the wrist pixel
+                # offset IS the finger-mid-line error, which is what matters
+                # for the close.  Prefer it over the head-based endpoint
+                # estimate (which carries the ~1.3 cm residual).  The head
+                # estimate remains the fallback when the wrist has no lock.
+                servo_lateral = lateral_error
+                if (
+                    self.wrist_enabled
+                    and remaining < 0.25
+                    and not target_touched_near
+                ):
+                    wlat = self.wrist_lateral_error_m()
+                    if wlat is not None and abs(wlat) < 0.06:
+                        servo_lateral = wlat
                 correction = float(np.clip(
-                    math.atan2(lateral_error, max(remaining, 0.18)),
+                    math.atan2(servo_lateral, max(remaining, 0.18)),
                     -max_correction,
                     max_correction,
                 ))
