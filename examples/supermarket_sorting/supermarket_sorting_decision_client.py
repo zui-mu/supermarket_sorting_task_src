@@ -100,12 +100,12 @@ class DecisionPickPlaceClient(PickPlaceClient):
                 self.get_logger().warn(
                     "[decision] cannot reset metrics file: %s" % exc)
         self._setup_decision_layer()
-        self.create_subscription(
-            String,
-            "/supermarket_sorting/inventory_observations",
-            self.inventory_observation_cb,
-            10,
-        )
+        # NOTE: the inventory subscription lives in the BASE client (single
+        # subscription).  Python binds self.inventory_observation_cb to THIS
+        # subclass method, so the base class subscription invokes the decision
+        # layer here.  Adding another subscription here (PR5: removed) would
+        # deliver each message twice and double-count hits, making
+        # INVENTORY_MIN_HITS=2 behave like a one-frame confirmation.
 
     def inventory_observation_cb(self, msg: String) -> None:
         try:
@@ -114,6 +114,15 @@ class DecisionPickPlaceClient(PickPlaceClient):
             return
         try:
             accepted = self.task_manager.register_inventory_observations(observations)
+            # PR5: the client ArUco kind gate must only reflect CONFIRMED
+            # inventory (the base class version of this callback is shadowed
+            # here, so update the map explicitly).
+            try:
+                for aruco_id, record in self.task_manager.inventory_by_aruco.items():
+                    if record.get("confirmed"):
+                        self.inventory_aruco_kind[int(aruco_id)] = str(record.get("kind", ""))
+            except Exception:  # noqa: BLE001
+                pass
             if accepted:
                 self.get_logger().info(f"[inventory] accepted {accepted} ArUco-bound observations")
                 self._refresh_active_task_from_inventory()
@@ -249,6 +258,10 @@ class DecisionPickPlaceClient(PickPlaceClient):
                 targets,
                 trust_layout_positions=self.allow_runtime_layout,
             )
+            # PR5: a new run re-randomises products under the fixed tags, so
+            # the client ArUco kind gate (and the manager inventory) must be
+            # reset together; last run's identity table is void.
+            self.inventory_aruco_kind.clear()
         except Exception as exc:  # noqa: BLE001 - a malformed task must not kill the node
             self.get_logger().error(
                 '[decision] failed to apply official task: %s' % exc)

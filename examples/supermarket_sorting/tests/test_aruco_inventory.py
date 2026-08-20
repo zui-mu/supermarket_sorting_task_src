@@ -105,6 +105,29 @@ def test_no_marker_below_rejected():
     print("OK no marker below")
 
 
+def test_competing_detection_does_not_fall_through_to_wrong_marker():
+    """PR5: a detection that is ambiguous BEFORE allocation must stay
+    rejected even if its "real" candidate later gets taken by a neighbour -
+    the old greedy could fall through to the wrong tag."""
+    import inventory
+    # tag0 (x=100) is the real candidate for det A; tag1 (x=300) is for det B.
+    # Det A has two candidates (tag0 at 100, tag1 at 300) because its box is
+    # wide; det B is tight over tag1.  Det A is ambiguous up front; det B must
+    # still bind tag1 (its only, unambiguous tag).
+    tags = [_marker(0, 100, 220), _marker(1, 300, 220)]
+    det_a = _det(200, 150, w=280, h=40)   # spans both tags -> ambiguous
+    det_b = _det(300, 150, w=60, h=40)    # tight over tag1 -> unambiguous
+    matches, _ = inventory.match_detections_to_markers([det_a, det_b], tags)
+    by_index = {m["detection_index"]: m for m in matches}
+    # det_a: ambiguous (rejected), NOT falling through to tag1.
+    self_assert = __import__("unittest").TestCase()
+    self_assert.assertEqual(by_index[0]["aruco_id"], None)
+    self_assert.assertTrue(by_index[0]["ambiguous"])
+    # det_b: still binds tag1.
+    self_assert.assertEqual(by_index[1]["aruco_id"], 1)
+    print("OK competing detection no fall-through")
+
+
 class ArucoInventoryTest(unittest.TestCase):
     def test_all_45_ids_decode(self):
         test_all_45_ids_decode()
@@ -120,6 +143,9 @@ class ArucoInventoryTest(unittest.TestCase):
 
     def test_no_marker_below_rejected(self):
         test_no_marker_below_rejected()
+
+    def test_competing_detection_does_not_fall_through_to_wrong_marker(self):
+        test_competing_detection_does_not_fall_through_to_wrong_marker()
 
 
 if __name__ == "__main__":

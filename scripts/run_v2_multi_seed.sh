@@ -27,7 +27,7 @@ for seed in ${SEEDS}; do
   LOG_DIR_HOST="${SUMMARY_DIR}/seed_${seed}" \
   CONTAINER_PREFIX="supermarket_official_${seed}" \
   DURATION_SEC="${DURATION_SEC}" \
-  REQUIRE_ALL_COMPLETIONS=0 \
+  SUPERMARKET_REQUIRE_ALL_COMPLETIONS="${SUPERMARKET_REQUIRE_ALL_COMPLETIONS:-0}" \
   SUPERMARKET_SEED="${seed}" \
     bash "${HOST_ROOT}/scripts/run_v2_official_test.sh" || true
 

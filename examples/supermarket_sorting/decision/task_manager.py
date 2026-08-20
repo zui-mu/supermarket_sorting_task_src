@@ -186,6 +186,10 @@ class TaskManager:
         A single detector frame is insufficient to turn an anonymous slot into
         a grasp target.  The record becomes usable only after repeated,
         spatially consistent observations of the same class.
+
+        PR5: a ``stamp``-level dedupe keeps one camera frame from counting as
+        two hits (the base/subclass subscription fix guarantees one delivery,
+        but a re-published frame must not double the hits either).
         """
         accepted = 0
         now = time.time()
@@ -224,6 +228,11 @@ class TaskManager:
             # the record for diagnostics.
             fresh_at = stamp if stamp is not None and abs(stamp - now) <= 60.0 else now
             previous = self.inventory_by_aruco.get(aruco_id)
+            # PR5: the same camera frame (same stamp) must not count twice.
+            if previous is not None and stamp is not None:
+                last_stamp = previous.get("last_stamp")
+                if last_stamp is not None and abs(float(last_stamp) - stamp) < 1e-6:
+                    continue
             if previous is None:
                 self.inventory_by_aruco[aruco_id] = {
                     "kind": kind,
@@ -238,6 +247,7 @@ class TaskManager:
                     "fresh_at": fresh_at,
                     "identity_seen_at": fresh_at,
                     "pose_seen_at": fresh_at,
+                    "last_stamp": stamp,
                 }
                 if INVENTORY_MIN_HITS == 1:
                     accepted += 1
@@ -248,9 +258,18 @@ class TaskManager:
 
             if previous.get("state") == INVENTORY_STATE_RESERVED:
                 # An active task has claimed this slot. Keep the reservation
-                # intact until that task settles it; otherwise a stream of
-                # fresh frames would silently demote `reserved` back to
-                # `confirmed` while the robot is already executing on it.
+                # intact, but PR5: still refresh the SHORT-LIVED pose from the
+                # same-kind observation (this is exactly the "re-acquire pose
+                # right before grasp" path) - do not demote `reserved`, do not
+                # bump hits/confirmation, just update the grasp coordinates.
+                if previous.get("kind") == kind:
+                    previous["world"] = world
+                    if marker_world is not None:
+                        previous["marker_world"] = marker_world
+                    previous["last_seen"] = stamp if stamp is not None else now
+                    previous["fresh_at"] = fresh_at
+                    previous["pose_seen_at"] = fresh_at
+                    previous["last_stamp"] = stamp
                 continue
 
             if previous.get("kind") != kind:
@@ -272,6 +291,7 @@ class TaskManager:
                     "fresh_at": fresh_at,
                     "identity_seen_at": fresh_at,
                     "pose_seen_at": fresh_at,
+                    "last_stamp": stamp,
                 }
                 if INVENTORY_MIN_HITS == 1:
                     accepted += 1
@@ -311,6 +331,7 @@ class TaskManager:
             previous["last_seen"] = stamp if stamp is not None else now
             previous["fresh_at"] = fresh_at
             previous["pose_seen_at"] = fresh_at
+            previous["last_stamp"] = stamp
             if previous["confirmed"] and not was_confirmed:
                 previous["identity_seen_at"] = fresh_at
                 accepted += 1
@@ -532,14 +553,19 @@ class TaskManager:
         return self.tasks
 
     def _inventory_has_all_requested(self) -> bool:
-        """PR4: True when every requested kind already has enough CONFIRMED
-        inventory (identity) - scanning can stop, remaining picks use the
-        observed slots instead of visiting every shelf."""
+        """PR4/PR5: True when every requested kind already has enough CONFIRMED
+        inventory (identity) for the REMAINING demand - scanning can stop,
+        remaining picks use the observed slots instead of visiting every shelf.
+        PR5: subtract what was already completed, so after one delivery the
+        remaining demand is requested - completed, not the full request."""
         if not self.requested_counts:
             return False
         now = time.time()
         for kind, need in self.requested_counts.items():
             if need <= 0:
+                continue
+            remaining = need - self.completed_counts.get(kind, 0)
+            if remaining <= 0:
                 continue
             have = sum(
                 1 for rec in self.inventory_by_aruco.values()
@@ -547,7 +573,7 @@ class TaskManager:
                 and self._inventory_identity_fresh(rec, now=now)
                 and rec.get("state") != INVENTORY_STATE_CONSUMED
             )
-            if have < need:
+            if have < remaining:
                 return False
         return True
 

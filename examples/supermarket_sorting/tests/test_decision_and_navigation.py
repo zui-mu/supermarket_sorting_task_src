@@ -366,13 +366,40 @@ class TaskManagerTests(unittest.TestCase):
             "marker_world": [0.71, 3.21, 0.89],
             "stamp": 123.45,
         }
-        manager.register_inventory_observations([observation, observation])
+        obs2 = dict(observation)
+        obs2["stamp"] = 123.46
+        manager.register_inventory_observations([observation, obs2])
         record = manager.inventory_by_aruco[31]
 
         self.assertEqual(record["kind"], "kele")
         self.assertEqual(record["state"], "confirmed")
-        self.assertAlmostEqual(record["last_seen"], 123.45)
+        self.assertAlmostEqual(record["last_seen"], 123.46)
         self.assertEqual(record["marker_world"], (0.71, 3.21, 0.89))
+
+    def test_same_stamp_counts_only_once(self):
+        """PR5: the same camera frame (identical stamp) must count as ONE hit,
+        not two - a duplicate delivery must not make INVENTORY_MIN_HITS=2
+        behave like a one-frame confirmation."""
+        manager = TaskManager()
+        manager.build_search_tasks_for_targets([{"id": "item_01", "kind": "kele"}])
+        active = manager.next_decision().selected_task
+        obs = {
+            "aruco_id": active.aruco_id,
+            "kind": "kele",
+            "confidence": 0.99,
+            "world": [active.world_position[0], active.world_position[1] - 0.02, 0.94],
+            "stamp": 200.0,
+        }
+        # Three deliveries of the SAME frame.
+        manager.register_inventory_observations([obs, dict(obs), dict(obs)])
+        record = manager.inventory_by_aruco[active.aruco_id]
+        self.assertEqual(record["hits"], 1)
+        self.assertEqual(record["state"], "observed")
+        # A genuinely different frame confirms.
+        obs2 = dict(obs)
+        obs2["stamp"] = 200.1
+        manager.register_inventory_observations([obs2])
+        self.assertEqual(manager.inventory_by_aruco[active.aruco_id]["state"], "confirmed")
 
     def test_success_consumes_inventory_record(self):
         manager = TaskManager()
@@ -553,6 +580,97 @@ class TaskManagerTests(unittest.TestCase):
         selected = manager.next_decision().selected_task
         # The confirmed slot is chosen; the un-observed scan slot is skipped.
         self.assertEqual(selected.aruco_id, 10)
+
+    def test_pr5_early_stop_uses_remaining_after_one_delivery(self):
+        """PR5: _inventory_has_all_requested compares REMAINING demand
+        (requested - completed).  After one kele delivered, one more confirmed
+        kele in inventory satisfies the remaining need."""
+        manager = TaskManager()
+        task_obs = self._manual_search_task("search_obs", 10, nav_x=0.70, nav_y=2.45)
+        manager.tasks = [task_obs]
+        manager.requested_counts = Counter({"kele": 2})
+        manager.completed_counts = Counter({"kele": 1})   # one already delivered
+        now = time.time()
+        manager.inventory_by_aruco[10] = {
+            "kind": "kele", "confidence": 0.9,
+            "world": (0.70, 2.45, 0.94), "hits": 3, "confirmed": True,
+            "state": "confirmed", "first_seen": now - 2.0, "last_seen": now - 2.0,
+            "fresh_at": now - 2.0, "identity_seen_at": now - 2.0, "pose_seen_at": now - 2.0,
+        }
+        # remaining = 2 - 1 = 1, have = 1 -> satisfied.
+        self.assertTrue(manager._inventory_has_all_requested())
+
+    def test_pr5_reserved_record_refreshes_pose_without_losing_reservation(self):
+        """PR5: a RESERVED slot must keep its reservation but refresh the
+        short-lived pose from same-kind observations."""
+        manager = TaskManager()
+        manager.build_search_tasks_for_targets([{"id": "item_01", "kind": "kele"}])
+        active = manager.next_decision().selected_task
+        aid = active.aruco_id
+        manager.register_inventory_observations([{
+            "aruco_id": aid, "kind": "kele", "confidence": 0.99,
+            "world": [active.world_position[0], active.world_position[1] - 0.02, 0.94],
+            "stamp": 300.0,
+        }, {
+            "aruco_id": aid, "kind": "kele", "confidence": 0.99,
+            "world": [active.world_position[0], active.world_position[1] - 0.02, 0.94],
+            "stamp": 300.1,
+        }])
+        self.assertEqual(manager.inventory_by_aruco[aid]["state"], "confirmed")
+        # Reserve it (as task selection does).
+        manager._reserve_inventory_record(active)
+        self.assertEqual(manager.inventory_by_aruco[aid]["state"], "reserved")
+        old_pose = manager.inventory_by_aruco[aid]["pose_seen_at"]
+        # A fresh same-kind frame arrives while reserved.
+        time.sleep(0.01)
+        manager.register_inventory_observations([{
+            "aruco_id": aid, "kind": "kele", "confidence": 0.99,
+            "world": [active.world_position[0], active.world_position[1] - 0.01, 0.94],
+            "stamp": 300.2,
+        }])
+        rec = manager.inventory_by_aruco[aid]
+        self.assertEqual(rec["state"], "reserved")
+        self.assertGreater(rec["pose_seen_at"], old_pose)
+
+    def test_pr5_new_run_clears_manager_inventory(self):
+        """PR5: a new /task payload (new run) clears the inventory table."""
+        manager = TaskManager()
+        manager.build_search_tasks_for_targets([{"id": "item_01", "kind": "kele"}])
+        active = manager.next_decision().selected_task
+        aid = active.aruco_id
+        world = [active.world_position[0], active.world_position[1] - 0.02, active.world_position[2]]
+        manager.register_inventory_observations([{
+            "aruco_id": aid, "kind": "kele", "confidence": 0.99,
+            "world": world, "stamp": 400.0,
+        }, {
+            "aruco_id": aid, "kind": "kele", "confidence": 0.99,
+            "world": world, "stamp": 400.1,
+        }])
+        self.assertTrue(manager.inventory_by_aruco)
+        # New run.
+        manager.build_search_tasks_for_targets([{"id": "item_02", "kind": "zhijin"}])
+        self.assertFalse(manager.inventory_by_aruco)
+
+    def test_pr5_one_conflicting_frame_does_not_replace_confirmed_kind(self):
+        """PR5: a single misclassification must not flip a confirmed slot."""
+        manager = TaskManager()
+        manager.build_search_tasks_for_targets([{"id": "item_01", "kind": "kele"}])
+        active = manager.next_decision().selected_task
+        aid = active.aruco_id
+        world = [active.world_position[0], active.world_position[1] - 0.02, active.world_position[2]]
+        for stamp in (500.0, 500.1):
+            manager.register_inventory_observations([{
+                "aruco_id": aid, "kind": "kele", "confidence": 0.99,
+                "world": world, "stamp": stamp,
+            }])
+        self.assertEqual(manager.inventory_by_aruco[aid]["kind"], "kele")
+        # One wrong frame (zhijin) must not replace the confirmed kele.
+        manager.register_inventory_observations([{
+            "aruco_id": aid, "kind": "zhijin", "confidence": 0.98,
+            "world": world, "stamp": 500.2,
+        }])
+        self.assertEqual(manager.inventory_by_aruco[aid]["kind"], "kele")
+        self.assertEqual(manager.inventory_by_aruco[aid]["state"], "confirmed")
 
     def test_inventory_scoring_honours_manual_reservation_bonus(self):
         manager = TaskManager()

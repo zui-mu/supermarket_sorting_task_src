@@ -21,6 +21,10 @@ COLUMN_LETTERS = ("C1", "C2", "C3")
 # Minimum margin between the best and the second-best association for the
 # best one to be accepted (a close second candidate is ambiguity, not a hit).
 ASSOC_MIN_MARGIN = float(__import__("os").getenv("SUPERMARKET_ASSOC_MIN_MARGIN", "0.12"))
+# Absolute score ceiling: even the best candidate above this is rejected
+# (tag too far / too weakly under the box).  Keeps a far neighbour's tag from
+# being grabbed when nothing better exists (PR5).
+ASSOC_MAX_SCORE = float(__import__("os").getenv("SUPERMARKET_ASSOC_MAX_SCORE", "1.5"))
 
 
 def aruco_id_to_slot(aruco_id: int) -> dict | None:
@@ -116,13 +120,32 @@ def match_detections_to_markers(detections, markers, *, max_gap_px=150):
         cands.sort(key=lambda c: c[0])
         candidates_by_det.append(cands)
 
+    # PR5: decide ambiguity BEFORE any greedy allocation.  A detection with
+    # two near-equal candidates is ambiguous regardless of what other
+    # detections do - the old greedy could leave the "real" candidate taken by
+    # a neighbour, then suddenly the ambiguous second became "the" answer.
+    ambiguous_dets: set[int] = set()
+    for det_index, cands in enumerate(candidates_by_det):
+        if len(cands) > 1 and cands[1][0] - cands[0][0] < ASSOC_MIN_MARGIN:
+            ambiguous_dets.add(det_index)
+
     # Greedy one-to-one: iterate detections by best-score; a tag used once is
-    # removed, so two products can never claim the same ArUco.
+    # removed, so two products can never claim the same ArUco.  Ambiguous
+    # detections never take part in the allocation.
     ranked = sorted(
         enumerate(candidates_by_det), key=lambda pair: pair[1][0][0] if pair[1] else 1e9
     )
     for det_index, cands in ranked:
         details.append([(score, mid) for score, mid, _ in cands])
+        if det_index in ambiguous_dets:
+            matches.append({
+                "detection_index": det_index,
+                "aruco_id": None,
+                "score": cands[0][0] if cands else float("inf"),
+                "reject_reason": "ambiguous_two_markers",
+                "ambiguous": True,
+            })
+            continue
         viable = [c for c in cands if c[1] not in used_marker_ids]
         if not viable:
             matches.append({
@@ -134,13 +157,13 @@ def match_detections_to_markers(detections, markers, *, max_gap_px=150):
             })
             continue
         best_score, best_id, _ = viable[0]
-        if len(viable) > 1 and viable[1][0] - best_score < ASSOC_MIN_MARGIN:
+        if best_score > ASSOC_MAX_SCORE:
             matches.append({
                 "detection_index": det_index,
                 "aruco_id": None,
                 "score": best_score,
-                "reject_reason": "ambiguous_two_markers",
-                "ambiguous": True,
+                "reject_reason": "score_above_max",
+                "ambiguous": False,
             })
             continue
         used_marker_ids.add(best_id)
