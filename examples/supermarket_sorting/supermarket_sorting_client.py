@@ -295,14 +295,14 @@ PLACE_RAISE_LATERAL_SCALES = tuple(
 # the verified complete clearing (run 63's upright landing). A slower reverse
 # shoves the bottle less.
 PLACE_REVERSE_DISTANCE = float(os.getenv("SUPERMARKET_PLACE_REVERSE_DISTANCE", "0.25"))
-PLACE_REVERSE_SPEED = float(os.getenv("SUPERMARKET_PLACE_REVERSE_SPEED", "0.025"))
+PLACE_REVERSE_SPEED = float(os.getenv("SUPERMARKET_PLACE_REVERSE_SPEED", "0.05"))
 # POST_PLACE_EGRESS (round 61): after the open, the EMPTY arm is tucked to
-# the low slide + INIT_ARM_R while the base reverses, so the next-task turn
-# has minimal sweep and cannot knock the just-placed bottle (the old 7 cm
-# reverse left the whole arm in the danger zone; audit confirmed the risk).
+# the low slide + INIT_ARM_R ONLY AFTER the base reverse has fully cleared
+# the bottle (round 61b: tucking while reversing swept the arm through the
+# just-released bottle -> "placement gripper did not open" + S5 not scored).
 PLACE_EGRESS_SLIDE = float(os.getenv("SUPERMARKET_PLACE_EGRESS_SLIDE", "0.10"))
 PLACE_EGRESS_CLEAR_EE_Z = float(os.getenv("SUPERMARKET_PLACE_EGRESS_CLEAR_EE_Z", "0.95"))
-PLACE_EGRESS_TIMEOUT = float(os.getenv("SUPERMARKET_PLACE_EGRESS_TIMEOUT", "6.0"))
+PLACE_EGRESS_TIMEOUT = float(os.getenv("SUPERMARKET_PLACE_EGRESS_TIMEOUT", "15.0"))
 # Westmost x allowed for a loaded-descent waypoint (the arm's lateral extent
 # makes anything further west scrape the perimeter wall on the waypoint turn).
 DELIVERY_MIN_SAFE_WEST_X = float(os.getenv("SUPERMARKET_DELIVERY_MIN_SAFE_WEST_X", "-1.95"))
@@ -523,7 +523,7 @@ PLACE_VERIFY_TIMEOUT = float(os.getenv("SUPERMARKET_PLACE_VERIFY_TIMEOUT", "10.0
 PLACE_OPEN_DWELL = float(os.getenv("SUPERMARKET_PLACE_OPEN_DWELL", "1.5"))
 PLACE_LOCAL_DONE_DWELL = float(os.getenv("SUPERMARKET_PLACE_LOCAL_DONE_DWELL", "1.0"))
 PLACE_LOWER_TIMEOUT = float(os.getenv("SUPERMARKET_PLACE_LOWER_TIMEOUT", "70.0"))
-PLACE_OPEN_TIMEOUT = float(os.getenv("SUPERMARKET_PLACE_OPEN_TIMEOUT", "8.0"))
+PLACE_OPEN_TIMEOUT = float(os.getenv("SUPERMARKET_PLACE_OPEN_TIMEOUT", "20.0"))
 # The slide servo in the official sim moves the column at ~1-2 mm/s; the
 # 0.19 -> 0.12 clear raise takes tens of seconds. The old 5 s timeout aborted
 # a physically successful placement mid-raise (verified: run 34 reached the
@@ -6480,21 +6480,28 @@ class PickPlaceClient(Node):
                 reverse_travel, reverse_done = self.place_reverse_progress()
                 if not reverse_done:
                     self.set_twist(-PLACE_REVERSE_SPEED, 0.0)
+                    # While reversing, ONLY open the fingers.  Do NOT tuck the
+                    # arm yet: the arm is still beside the just-released
+                    # bottle and tucking would sweep it (round 61b: this
+                    # knocked the bottle -> S5 not scored -> open timeout).
+                    self.place_arm_slow = False
                 else:
                     self.set_twist(0.0, 0.0)
-                # Egress: raise/tuck the empty arm to low slide + INIT_ARM_R
-                # with the slow slew (fast tuck could fling the finger-mount
-                # box into the just-released bottle).
-                self.place_arm_slow = True
-                self.tc[2] = PLACE_EGRESS_SLIDE
-                self.tc[12:18] = list(INIT_ARM_R)
+                    # Reverse complete: the arm is now ~0.25 m clear of the
+                    # bottle.  Tuck the EMPTY arm (low slide + INIT_ARM_R)
+                    # with the slow slew so the next-task turn has minimal
+                    # sweep.
+                    self.place_arm_slow = True
+                    self.tc[2] = PLACE_EGRESS_SLIDE
+                    self.tc[12:18] = list(INIT_ARM_R)
                 ee_z = float(self.ee_world()[2])
                 arm_err = float(np.max(np.abs(
                     np.asarray(self.rarm_meas, dtype=float) - np.asarray(INIT_ARM_R))))
                 egress_ok = (
-                    float(self.slide_meas) <= 0.15
+                    reverse_done
+                    and float(self.slide_meas) <= 0.15
                     and ee_z >= PLACE_EGRESS_CLEAR_EE_Z
-                ) or arm_err < 0.12
+                ) or (reverse_done and arm_err < 0.12)
                 egress_timeout = (
                     self.place_egress_started is not None
                     and self.now() - self.place_egress_started > PLACE_EGRESS_TIMEOUT
