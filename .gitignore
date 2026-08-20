@@ -272,3 +272,9 @@ decision_trace.jsonl
 *.pt
 *.pth
 *.onnx
+# ---- local run logs & generated artifacts (do not share) ----
+logs*/
+*.out
+*.err
+mission_metrics.jsonl
+supermarket_sorting_mission_metrics.jsonl

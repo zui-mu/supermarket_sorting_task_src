@@ -39,13 +39,20 @@ class SupermarketGridPlanner:
     # World positions are taken from retail_competition.xml.  Rectangles store
     # physical extents; robot clearance is applied separately.
     STATIC_OBSTACLES = (
+        # These are the invariant MJCF structures.  The five cardboard boxes
+        # are intentionally *not* listed here: V2 randomises them each run,
+        # so their occupancy must come from the public LaserScan.
         Rect(0.50, 0.56, -3.72, 1.70),       # corridor_right_board
-        Rect(-0.638, -0.038, -2.069, -1.669),
-        Rect(-0.210, 0.190, 0.530, 1.130),
-        Rect(-2.310, -1.710, -1.314, -0.914),
-        Rect(-2.322, -1.922, 1.115, 1.715),
-        Rect(-1.370, -0.770, -0.397, 0.003),
         Rect(-2.420, -1.460, -3.630, -3.190),  # delivery table
+        # Perimeter walls (retail_competition.xml, size 0.03).  Without them
+        # the wall surfaces enter the lidar dynamic set and get inflated like
+        # boxes, which can close a real wall-side passage (verified: the west
+        # passage beside box_04 is 0.96 m wide, but wall hits inflated 0.5 m
+        # made the delivery A* report no route).
+        Rect(-2.530, -2.470, -3.750, 3.750),  # west_wall
+        Rect(2.470, 2.530, -3.750, 3.750),    # east_wall
+        Rect(-2.500, 2.500, 3.720, 3.780),    # north_wall
+        Rect(-2.500, 2.500, -3.780, -3.720),  # south_wall
     )
 
     def __init__(
@@ -53,17 +60,36 @@ class SupermarketGridPlanner:
         resolution: float = 0.10,
         robot_radius: float = 0.22,
         corridor_clearance: float = 0.45,
+        dynamic_clearance: float | None = None,
         bounds: tuple[float, float, float, float] = (-2.35, 2.35, -3.48, 3.02),
     ):
         self.resolution = float(resolution)
         self.robot_radius = float(robot_radius)
         self.corridor_clearance = float(corridor_clearance)
+        # Dynamic points come from lidar/depth and represent obstacle centres,
+        # so a loaded robot may need a larger envelope than the bare chassis.
+        self.dynamic_clearance = float(
+            self.robot_radius if dynamic_clearance is None else dynamic_clearance
+        )
         self.xmin, self.xmax, self.ymin, self.ymax = bounds
         self.width = int(round((self.xmax - self.xmin) / self.resolution)) + 1
         self.height = int(round((self.ymax - self.ymin) / self.resolution)) + 1
         self.static_rects = (
             self.STATIC_OBSTACLES[0].inflated(self.corridor_clearance),
             *(rect.inflated(self.robot_radius) for rect in self.STATIC_OBSTACLES[1:]),
+        )
+        # Raw (uninflated) footprints, used to discard lidar hits that land on
+        # the modelled structures themselves.  Without this, a lidar hit on the
+        # divider face gets inflated AGAIN on top of the static inflation and
+        # can choke the whole descent corridor (verified: the loaded delivery
+        # A* returned no route at all).
+        self.static_raw_rects = tuple(self.STATIC_OBSTACLES)
+        # The odometry used to build world-frame lidar points drifts a few
+        # centimetres, so wall hits land just OUTSIDE the raw footprints
+        # (verified: west-wall hits at x=-2.42..-2.58 vs the wall at -2.47)
+        # and re-enter the dynamic inflation. Filter with a small tolerance.
+        self.static_raw_rects_filter = tuple(
+            rect.inflated(0.10) for rect in self.STATIC_OBSTACLES
         )
 
     def plan(
@@ -77,6 +103,14 @@ class SupermarketGridPlanner:
         start_cell = self._to_cell(start_xy)
         goal_cell = self._to_cell(goal_xy)
         dynamic = self._dynamic_cells(dynamic_points)
+
+        # A goal sitting inside an inflated obstacle cannot be reached: report
+        # failure explicitly so the caller falls back/fails instead of being
+        # handed a path whose last waypoint lies inside the obstacle. The start
+        # keeps its exemption because the robot may already be parked close to
+        # a structure when the replan begins.
+        if goal_cell != start_cell and self._blocked(goal_cell, dynamic):
+            return []
 
         frontier: list[tuple[float, float, tuple[int, int]]] = []
         heapq.heappush(frontier, (self._heuristic(start_cell, goal_cell), 0.0, start_cell))
@@ -142,10 +176,16 @@ class SupermarketGridPlanner:
 
     def _dynamic_cells(self, points: Iterable[Iterable[float]]) -> set[tuple[int, int]]:
         occupied: set[tuple[int, int]] = set()
-        radius_cells = max(1, int(math.ceil(self.robot_radius / self.resolution)))
+        radius_cells = max(1, int(math.ceil(self.dynamic_clearance / self.resolution)))
         for point in points:
             p = np.asarray(tuple(point), dtype=float)
             if p.size < 2 or not np.all(np.isfinite(p[:2])):
+                continue
+            # Hits on the modelled static structures are already covered by the
+            # (inflated) static rects; inflating them again as "dynamic" points
+            # would double-count the divider/table envelope. A small tolerance
+            # absorbs the odometry drift on the world-frame hit positions.
+            if any(rect.contains(float(p[0]), float(p[1])) for rect in self.static_raw_rects_filter):
                 continue
             cx, cy = self._to_cell(p[:2])
             for ix in range(cx - radius_cells, cx + radius_cells + 1):
@@ -183,22 +223,29 @@ class SupermarketGridPlanner:
         b: tuple[int, int],
         dynamic: set[tuple[int, int]],
     ) -> bool:
-        dx, dy = b[0] - a[0], b[1] - a[1]
-        # Half-cell sampling is deliberately conservative. Sampling only once
-        # per cell can round over a corner and prune a safe A* detour into an
-        # unsafe diagonal that clips an inflated obstacle.
-        steps = max(2 * max(abs(dx), abs(dy)), 1)
-        for i in range(steps + 1):
+        # Sample in continuous world space at half-cell steps. Cell-centre
+        # rounding can skip a corner of an inflated obstacle on a long
+        # diagonal, which would prune a safe A* detour into an unsafe line.
+        ax, ay = self._to_world(a)
+        bx, by = self._to_world(b)
+        dist = float(math.hypot(bx - ax, by - ay))
+        steps = max(1, int(math.ceil(dist / (self.resolution * 0.5))))
+        for i in range(1, steps):
             t = i / steps
-            cell = (int(round(a[0] + dx * t)), int(round(a[1] + dy * t)))
+            x = ax + (bx - ax) * t
+            y = ay + (by - ay) * t
+            cell = self._to_cell((x, y))
             if cell not in (a, b) and self._blocked(cell, dynamic):
                 return False
         return True
 
     def _to_cell(self, point: Iterable[float]) -> tuple[int, int]:
         x, y = tuple(point)[:2]
-        ix = int(round((float(x) - self.xmin) / self.resolution))
-        iy = int(round((float(y) - self.ymin) / self.resolution))
+        # floor(x + 0.5) gives a symmetric nearest-cell rounding; Python's
+        # built-in round() uses banker's rounding, which biases the exact
+        # half-cell boundary toward even cells.
+        ix = int(math.floor((float(x) - self.xmin) / self.resolution + 0.5))
+        iy = int(math.floor((float(y) - self.ymin) / self.resolution + 0.5))
         return (
             min(max(ix, 0), self.width - 1),
             min(max(iy, 0), self.height - 1),

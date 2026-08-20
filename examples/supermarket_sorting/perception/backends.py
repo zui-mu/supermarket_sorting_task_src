@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 Pluggable 2-D detector backends for the kele perception pipeline.
 
@@ -8,13 +8,13 @@ Each backend exposes a single method::
 
 where every dict has::
 
-    class  : str   – always 'kele' for all backends here
-    x, y   : int   – pixel coords of the bbox centre
-    w, h   : int   – bbox size in pixels
-    conf   : float – confidence in [0, 1]
+    class  : str   鈥?always 'kele' for all backends here
+    x, y   : int   鈥?pixel coords of the bbox centre
+    w, h   : int   鈥?bbox size in pixels
+    conf   : float 鈥?confidence in [0, 1]
 
-The downstream node does pixel→camera-frame deprojection and the
-camera→world transform.  Backends do NOT need to know the world frame.
+The downstream node does pixel鈫抍amera-frame deprojection and the
+camera鈫抴orld transform.  Backends do NOT need to know the world frame.
 
 Exception: GtProjectionBackend (for coord-bridge validation) also
 accepts T_cam_world to project GT world positions to pixels; it sets
@@ -36,7 +36,37 @@ import cv2
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
-_CLASS = 'kele'
+OFFICIAL_CLASSES = {
+    "sanmingzhi", "heweidao", "shupian", "zhijin", "maidong",
+    "kele", "kouxiangtang", "pingguo", "chengzi",
+}
+_CLASS = os.getenv("SUPERMARKET_BLOB_CLASS", "generic_blob")
+
+
+def stable_class_consensus(
+    labels,
+    *,
+    min_samples: int = 3,
+    min_ratio: float = 0.67,
+):
+    """Return a label only after a short, unambiguous temporal consensus.
+
+    A single detector frame is not a safe inventory observation: occlusion by
+    the gripper and depth edge noise can change the class for one frame.  This
+    helper is intentionally dependency-free so the decision layer can test the
+    rule without importing ROS or Ultralytics.
+    """
+    values = [str(label).strip() for label in labels if str(label).strip()]
+    if len(values) < max(1, int(min_samples)):
+        return None
+    counts = {}
+    for value in values:
+        counts[value] = counts.get(value, 0) + 1
+    label, count = max(counts.items(), key=lambda item: (item[1], item[0]))
+    ratio = count / float(len(values))
+    if ratio < float(min_ratio):
+        return None
+    return label
 
 
 def _safe_depth_m(depth_img: np.ndarray, cx: int, cy: int, r: int = 4) -> float:
@@ -56,7 +86,7 @@ class GtProjectionBackend:
     """Validate the coordinate bridge.
 
     Projects each requested slot's GT world position to pixels via T_cam_world,
-    then the node's pixel→world path should reconstruct the same point.
+    then the node's pixel鈫抴orld path should reconstruct the same point.
     Attach 'gt_world_pos' to each detection dict for logging.
 
     This backend requires T_cam_world to be passed in (not None).
@@ -89,7 +119,7 @@ class GtProjectionBackend:
         H, W = rgb.shape[:2]
         fx, fy = K[0, 0], K[1, 1]
         cx, cy = K[0, 2], K[1, 2]
-        T_world_cam = np.linalg.inv(T_cam_world)  # world → camera
+        T_world_cam = np.linalg.inv(T_cam_world)  # world 鈫?camera
 
         detections = []
         for slot in self.slots:
@@ -101,7 +131,7 @@ class GtProjectionBackend:
             v = int(fy * pc[1] / pc[2] + cy)
             if not (0 <= u < W and 0 <= v < H):
                 continue            # out of frame
-            # fake bbox (10 × 10 px around projection)
+            # fake bbox (10 脳 10 px around projection)
             bbox_px = 20
             detections.append({
                 'class': slot.get('object_kind', _CLASS),
@@ -196,40 +226,96 @@ class BlobBackend:
 # YoloBackend  (drop-in final backend once kele.pt is trained)
 # ---------------------------------------------------------------------------
 class YoloBackend:
-    """YOLOv8 detector (ultralytics).  Mirrors the reference yolo_detect.py
-    but stripped to single-class 'kele'.
+    """YOLOv8 detector (ultralytics).
 
-    If the checkpoint file does not exist yet the backend logs a warning and
-    returns an empty list (graceful degradation; swap to BlobBackend instead).
+    This backend fails fast on missing or invalid weights so formal runs do
+    not "succeed" while silently returning empty detections.
     """
-
-    CLASS_NAMES = ['kele']
 
     def __init__(self, ckpt_path: str, conf_thresh: float = 0.65):
         self.conf_thresh = conf_thresh
         self.model = None
+        self.class_names = {}
+        self.class_count = 0
+        self.is_official_multiclass = False
+        self.ckpt_path = ckpt_path
+        self.require_official_classes = (
+            os.getenv("SUPERMARKET_YOLO_REQUIRE_OFFICIAL_CLASSES", "0").strip() == "1"
+        )
+
         if not os.path.isfile(ckpt_path):
-            print(f"[YoloBackend] checkpoint not found: {ckpt_path} — returning empty detections")
-            return
+            raise FileNotFoundError(f"[YoloBackend] checkpoint not found: {ckpt_path}")
+
         try:
             import torch
             from ultralytics import YOLO
 
-            device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-            # Patch torch.load for pre-2.6 checkpoints
+            requested_device = os.getenv("SUPERMARKET_YOLO_DEVICE", "auto").strip().lower()
+            if requested_device in {"", "auto"}:
+                device_name = "cuda:0" if torch.cuda.is_available() else "cpu"
+            elif requested_device == "cpu":
+                device_name = "cpu"
+            elif requested_device in {"cuda", "cuda:0"} and torch.cuda.is_available():
+                device_name = "cuda:0"
+            else:
+                raise RuntimeError(
+                    "SUPERMARKET_YOLO_DEVICE must be auto, cpu, or cuda:0; "
+                    f"got {requested_device!r}"
+                )
+            device = torch.device(device_name)
+
+            # Patch torch.load for pre-2.6 checkpoints.
             _orig = torch.load
+
             def _compat(*a, **kw):
-                kw.setdefault('weights_only', False)
+                kw.setdefault("weights_only", False)
                 return _orig(*a, **kw)
+
             torch.load = _compat
             try:
                 self.model = YOLO(ckpt_path).to(device)
                 self.model.model.eval()
+                # A competition checkpoint may contain all product classes.
+                # Never silently relabel every prediction as kele.
+                names = getattr(self.model, "names", None)
+                if names is None:
+                    names = getattr(self.model.model, "names", {})
+                self.class_names = names or {}
             finally:
                 torch.load = _orig
-            print(f"[YoloBackend] loaded {ckpt_path}")
+
+            if isinstance(self.class_names, dict):
+                class_count = len(self.class_names)
+            else:
+                class_count = len(self.class_names)
+            self.class_count = class_count
+            if class_count <= 0:
+                raise RuntimeError(f"[YoloBackend] checkpoint {ckpt_path} exposes no class names")
+
+            names = set(str(value) for value in (
+                self.class_names.values() if isinstance(self.class_names, dict)
+                else self.class_names
+            ))
+            self.is_official_multiclass = (
+                class_count == len(OFFICIAL_CLASSES) and names == OFFICIAL_CLASSES
+            )
+            mode = "multi-class" if class_count > 1 else "single-class"
+            print(
+                f"[YoloBackend] loaded {ckpt_path}; classes={class_count} "
+                f"({mode}); device={device_name}"
+            )
+            if self.require_official_classes and not self.is_official_multiclass:
+                raise RuntimeError(
+                    "[YoloBackend] official mode requires a nine-class checkpoint "
+                    "with the official product names"
+                )
+            if class_count > 1 and not self.is_official_multiclass:
+                print(
+                    "[YoloBackend] warning: checkpoint class names do not match "
+                    "the nine official product kinds"
+                )
         except Exception as e:
-            print(f"[YoloBackend] failed to load model: {e}")
+            raise RuntimeError(f"[YoloBackend] failed to load model from {ckpt_path}: {e}") from e
 
     def detect(
         self,
@@ -239,7 +325,9 @@ class YoloBackend:
         T_cam_world: np.ndarray | None = None,
     ) -> list[dict]:
         if self.model is None:
-            return []
+            raise RuntimeError(
+                f"[YoloBackend] detector is not initialized; checkpoint={self.ckpt_path}"
+            )
         results = self.model(rgb, verbose=False)[0]
         detections = []
         for box in results.boxes:
@@ -247,11 +335,19 @@ class YoloBackend:
             if conf < self.conf_thresh:
                 continue
             cls_id = int(box.cls.item())
-            if cls_id >= len(self.CLASS_NAMES):
+            if isinstance(self.class_names, dict):
+                # Ultralytics normally uses integer keys, but exported models
+                # can expose JSON-style string keys.
+                class_name = self.class_names.get(
+                    cls_id, self.class_names.get(str(cls_id))
+                )
+            else:
+                class_name = self.class_names[cls_id] if cls_id < len(self.class_names) else None
+            if class_name is None:
                 continue
             x0, y0, x1, y1 = map(int, box.xyxy[0].cpu().numpy())
             detections.append({
-                'class': self.CLASS_NAMES[cls_id],
+                'class': str(class_name),
                 'x': (x0 + x1) // 2,
                 'y': (y0 + y1) // 2,
                 'w': x1 - x0,
@@ -259,3 +355,4 @@ class YoloBackend:
                 'conf': conf,
             })
         return detections
+

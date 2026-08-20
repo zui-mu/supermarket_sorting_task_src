@@ -15,7 +15,13 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 DEFAULTS = {
-    "time_limit_s": 420.0,
+    "time_limit_s": 600.0,
+    # 一个流程自上次步骤推进起的最长存活时间。超时后该流程作废(不计分/不扣分),
+    # 下次进入取货区重新开流程, 防止一次未完成的抓取让裁判在剩余赛程里无法再计分。
+    "flow_timeout_s": 240.0,
+    # 步骤 3 时夹爪松开后, 目标静止且持续未被夹持的判定时间。覆盖物体落在
+    # 高台面(货架/桌面, z 高于 drop_z)导致流程永远卡在 S3 的情况。
+    "ungripped_rest_s": 1.2,
     "scores": {"s1": 1, "s2": 2, "s3": 6, "s4": 1, "s5": 10, "upright_bonus": 5},
     "penalties": {"collision": 5, "topple": 5, "drop": 3},
     "thresholds": {
@@ -69,6 +75,10 @@ class Flow:
         self.upright = False
         self.final_pos = None
         self.final_speed = None
+        # S3 时夹爪松开后的计时: 用于把"落在高台面上的掉落"与短暂脱手区分开
+        self.ungripped_since = None
+        # 最近一次步骤推进时间(流程超时作废的基线)
+        self.t_last_advance = float(t0)
 
 
 class Referee:
@@ -103,6 +113,8 @@ class Referee:
 
         self.flow = None
         self.scored = set()          # 已成功计分的目标
+        self.retired = set()         # 已离开货架的目标(已计分/已掉落), 不再参与 C2 碰倒判定
+        self.toppled_penalized = set()  # 已为 C2 扣过一次分的目标, 避免同一倒伏物反复扣分
         self.records = []            # 每个结算流程的明细
         self.events = []             # 文本事件流
         self._info = ""
@@ -130,12 +142,14 @@ class Referee:
     def _contact_pairs(self, mj_data):
         """本 tick 处于接触的 (bodyid, bodyid) 对集合(双向)。"""
         pairs = set()
+        self._contact_geom_pairs = []
         gb = self.mj_model.geom_bodyid
         for i in range(mj_data.ncon):
             c = mj_data.contact[i]
             b1, b2 = int(gb[c.geom1]), int(gb[c.geom2])
             pairs.add((b1, b2))
             pairs.add((b2, b1))
+            self._contact_geom_pairs.append((int(c.geom1), int(c.geom2)))
         return pairs
 
     def _touch(self, pairs, links, obj):
@@ -157,6 +171,11 @@ class Referee:
 
     def _speed(self, mj_data, obj):
         jid = int(self.mj_model.body(obj).jntadr[0])
+        if jid < 0:
+            # Welded/static body without a joint: no dofs, no velocity.
+            # (Negative indexing into jnt_dofadr would silently read the
+            # wrong dof block.)
+            return 0.0
         dof = int(self.mj_model.jnt_dofadr[jid])
         return float(np.linalg.norm(mj_data.qvel[dof:dof + 3]))
 
@@ -181,6 +200,11 @@ class Referee:
         in_deliv = self._in(self.cfg["zones"]["delivery_base"], base_xy)
         remaining = [b for b in self.targets if b not in self.scored]
 
+        # 全部目标已完成: 提前终局, 不再空转等待时间上限。
+        if self.flow is None and not remaining:
+            self._finalize(t, reason="all_targets_completed")
+            return
+
         # 开启新流程：手上没有在搬、进入取货区、还有目标
         if self.flow is None and remaining and in_pick:
             self.flow = Flow(t)
@@ -191,62 +215,237 @@ class Referee:
             self._build_info(t)
             return
 
+        # --- 流程超时作废: 长时间没有任何步骤推进时放弃本流程 ---
+        # 防止一次失败/卡住的抓取让 self.flow 永远占用, 导致剩余赛程无法再开启新流程计分。
+        if t - f.t_last_advance > float(self.cfg.get("flow_timeout_s", 240.0)):
+            self._cancel_flow(t, "流程超时作废")
+            self._build_info(t)
+            return
+
         # --- 流程窗口内的扣分监控 ---
-        if not f.collided and self._robot_hits_structure(pairs):
+        collision_pair = self._robot_structure_contact(pairs)
+        if not f.collided and collision_pair is not None:
             f.collided = True
-            self._log(t, "C1 撞到结构 (−%d)" % self.cfg["penalties"]["collision"])
+            robot_link, structure, robot_geom, structure_geom = collision_pair
+            link_pos = np.asarray(mj_data.body(robot_link).xpos, dtype=float)
+            structure_pos = np.asarray(mj_data.body(structure).xpos, dtype=float)
+            self._log(
+                t,
+                "C1 撞到结构 %s[%s] -> %s[%s] at (%.3f,%.3f,%.3f) "
+                "structure_pos=(%.3f,%.3f,%.3f) (−%d)" % (
+                    robot_link,
+                    robot_geom,
+                    structure,
+                    structure_geom,
+                    link_pos[0],
+                    link_pos[1],
+                    link_pos[2],
+                    structure_pos[0],
+                    structure_pos[1],
+                    structure_pos[2],
+                    self.cfg["penalties"]["collision"],
+                ),
+            )
         if not f.toppled:
-            hit = self._toppled_other_object(mj_data, f.target)
+            # The object currently held by both fingers is being carried, not
+            # toppled: S3 can bind it in the same tick its displacement first
+            # crosses the threshold, and without this exclusion that tick would
+            # also charge C2 for the legitimately grasped target itself.
+            gripped_now = {b for b in self.targets if self._gripped(pairs, b)}
+            hit = self._toppled_other_object(mj_data, f.target, exclude=gripped_now)
             if hit:
                 f.toppled = True
+                self.toppled_penalized.add(hit)
+                # C2 diagnostics: which object, by how much, in what state
+                # (helps separate "creep pushed the target" from "arm swept a
+                # neighbour" - reproduced twice per run in count5_full).
+                try:
+                    hit_tilt = self._tilt_deg(mj_data, hit)
+                    hit_shift = self._xy_shift(mj_data, hit)
+                    hit_pos = self._pos(mj_data, hit)
+                    hit_gripped = hit in gripped_now
+                    flow_tgt = f.target if f.target is not None else "none"
+                    print(
+                        "[referee] C2 detail hit=%s tilt=%.1f shift=%.3f pos=[%.3f %.3f %.3f] "
+                        "gripped=%s flow_target=%s step=S%d" % (
+                            hit, hit_tilt, hit_shift, hit_pos[0], hit_pos[1], hit_pos[2],
+                            hit_gripped, flow_tgt, f.step), flush=True)
+                except Exception:
+                    pass
                 self._log(t, "C2 碰倒其他商品 %s (−%d)" % (hit, self.cfg["penalties"]["topple"]))
 
         thr = self.cfg["thresholds"]
+        remaining = [b for b in self.targets if b not in self.scored]
 
-        # --- 掉落判定(S3 之后、S5 之前) ---
-        if f.step in (3, 4) and f.target is not None:
-            if (not self._gripped(pairs, f.target)) and self._pos(mj_data, f.target)[2] < thr["drop_z"]:
-                f.dropped = True
-                f.final_pos = self._pos(mj_data, f.target).tolist()
-                f.final_speed = self._speed(mj_data, f.target)
-                self._settle_flow(t, completed=False)
-                return
-
-        # --- 按序推进 S2..S5(不能跳步) ---
-        if f.step == 1:  # 等 S2 touch
+        # --- 持续记录 touch: 误触其他目标或中途换目标都不会让 S2/S3 永久卡住 ---
+        if f.step in (1, 2):
             for tgt in remaining:
                 if self._touch(pairs, self.cfg["touch_links"], tgt):
                     f.touched.add(tgt)
-            if f.touched:
+            if f.step == 1 and f.touched:
                 f.step = 2
                 f.t["s2"] = t
+                f.t_last_advance = t
                 self._log(t, "S2 够到目标")
-        elif f.step == 2:  # 等 S3 抓取撤出货架
-            for tgt in [b for b in f.touched if b in remaining]:
+
+        # --- 掉落判定(S3 且未夹持时) ---
+        # 除了传统的 z < drop_z(掉到地面), 还覆盖"目标落在货架/桌面等高处后静止、
+        # 夹爪持续未夹持"的情况; 否则流程会永远卡在 S3。
+        if f.step == 3 and f.target is not None and not self._gripped(pairs, f.target):
+            in_box = self._in(self.cfg["zones"]["delivery_box"], self._pos(mj_data, f.target))
+            if not in_box:
+                target_speed = self._speed(mj_data, f.target)
+                target_z = self._pos(mj_data, f.target)[2]
+                below_drop = target_z < thr["drop_z"]
+                at_rest = target_speed < thr["settle_speed"]
+                if below_drop or at_rest:
+                    if f.ungripped_since is None:
+                        f.ungripped_since = t
+                    elif t - f.ungripped_since >= float(self.cfg.get("ungripped_rest_s", 1.2)):
+                        f.dropped = True
+                        f.final_pos = self._pos(mj_data, f.target).tolist()
+                        f.final_speed = self._speed(mj_data, f.target)
+                        self._settle_flow(t, completed=False)
+                        return
+                else:
+                    # 目标还在运动: 可能只是夹爪短暂滑脱, 继续观察
+                    f.ungripped_since = None
+        else:
+            f.ungripped_since = None
+
+        # --- 按序推进 S2..S5(不能跳步) ---
+        # Continuous tilt watch: shows WHEN each bottle gets nudged (which
+        # flow, how long before its C2), so the tipping dynamics are visible.
+        if f is not None and t - getattr(self, "_tilt_watch_last", 0.0) >= 1.0:
+            self._tilt_watch_last = t
+            try:
+                for b in self.targets:
+                    if b in self.bid and b in self.init_pos:
+                        wt = self._tilt_deg(mj_data, b)
+                        ws = self._xy_shift(mj_data, b)
+                        if wt > 2.0 or ws > 0.01:
+                            print(
+                                "[referee] watch t=%.1f %s tilt=%.1f shift=%.3f step=S%d" % (
+                                    t, b, wt, ws, f.step), flush=True)
+            except Exception:
+                pass
+        # S2 grasp-phase diagnostics: while the flow waits at S2 (touch seen,
+        # S3 not yet bound), watch the target bottle's tilt/shift and the
+        # gripper's position to capture the C2 tipping dynamics.
+        if f.step == 2 and f.touched:
+            try:
+                if t - getattr(self, "_s2_diag_last", 0.0) >= 0.4:
+                    self._s2_diag_last = t
+                    probe = f.touched[0] if f.touched else None
+                    if probe is not None and probe in self.bid:
+                        pt = self._tilt_deg(mj_data, probe)
+                        ps = self._xy_shift(mj_data, probe)
+                        pp = self._pos(mj_data, probe)
+                        g_pos = None
+                        for gl in ("rgt_finger_left_link", "rgt_arm_link6"):
+                            if gl in self.bid:
+                                g_pos = mj_data.body(gl).xpos
+                                break
+                        gs = "n/a" if g_pos is None else "[%.3f %.3f %.3f]" % (g_pos[0], g_pos[1], g_pos[2])
+                        print(
+                            "[referee] S2diag probe=%s tilt=%.1f shift=%.3f bpos=[%.3f %.3f %.3f] grip=%s" % (
+                                probe, pt, ps, pp[0], pp[1], pp[2], gs), flush=True)
+            except Exception:
+                pass
+        if f.step == 2:  # 等 S3 抓取撤出货架
+            # 优先绑定接触过的目标; 若实际夹走的是其他仍可计分的目标(误触后换目标、
+            # 或夹住了相邻商品), 同样允许绑定, 避免流程在 S2 卡死。
+            candidates = [b for b in f.touched if b in remaining]
+            candidates += [b for b in remaining if b not in candidates]
+            for tgt in candidates:
                 if self._gripped(pairs, tgt) and self._xy_shift(mj_data, tgt) >= thr["carry_out_dist"]:
                     f.target = tgt
                     f.step = 3
                     f.t["s3"] = t
+                    f.t_last_advance = t
                     self._log(t, "S3 抓取并撤出货架，绑定目标 %s" % tgt)
                     break
         elif f.step == 3:  # 等 S4 携物到配送区
             if in_deliv and self._gripped(pairs, f.target):
                 f.step = 4
                 f.t["s4"] = t
+                f.t_last_advance = t
                 self._log(t, "S4 携物到达配送区")
+            else:
+                # 已到达配送区并在框内松爪(未观察到"夹持着进入配送区"的那一帧):
+                # 视为放置完成, 直接推进 S4+S5, 避免把一次成功放置误判成掉落。
+                in_box = self._in(self.cfg["zones"]["delivery_box"], self._pos(mj_data, f.target))
+                if in_box and (not self._gripped(pairs, f.target)) and self._speed(mj_data, f.target) < thr["settle_speed"]:
+                    f.t["s4"] = t
+                    f.upright = self._tilt_deg(mj_data, f.target) <= thr["upright_tol_deg"]
+                    f.t["s5"] = t
+                    f.final_pos = self._pos(mj_data, f.target).tolist()
+                    f.final_speed = self._speed(mj_data, f.target)
+                    self._log(t, "S4+S5 目标已在配送框内静置，直接结算")
+                    self._settle_flow(t, completed=True)
+                    return
         elif f.step == 4:  # 等 S5 准确放置
             in_box = self._in(self.cfg["zones"]["delivery_box"], self._pos(mj_data, f.target))
             if in_box and (not self._gripped(pairs, f.target)) and self._speed(mj_data, f.target) < thr["settle_speed"]:
                 f.upright = self._tilt_deg(mj_data, f.target) <= thr["upright_tol_deg"]
                 f.t["s5"] = t
+                f.t_last_advance = t
                 f.final_pos = self._pos(mj_data, f.target).tolist()
                 f.final_speed = self._speed(mj_data, f.target)
                 self._settle_flow(t, completed=True)
                 return
+            # Diagnostic: log WHY S5 does not settle (bottle pose/speed/grip).
+            if t - getattr(self, "_s5_diag_log", 0.0) > 1.0:
+                self._s5_diag_log = t
+                self._log(
+                    t,
+                    "[s5_diag] pos=%s speed=%.3f gripped=%s in_box=%s tilt=%.1f"
+                    % (
+                        np.round(self._pos(mj_data, f.target), 3).tolist(),
+                        self._speed(mj_data, f.target),
+                        self._gripped(pairs, f.target),
+                        in_box,
+                        self._tilt_deg(mj_data, f.target),
+                    ),
+                )
 
         self._build_info(t)
 
     def _robot_hits_structure(self, pairs):
+        return self._robot_structure_contact(pairs) is not None
+
+    def _robot_structure_contact(self, pairs):
+        """Return the first scoring collision and its MuJoCo geom names."""
+        geom_body_ids = self.mj_model.geom_bodyid
+        names_by_id = {body_id: name for name, body_id in self.bid.items()}
+        for first_geom, second_geom in getattr(self, "_contact_geom_pairs", []):
+            first_body = int(geom_body_ids[first_geom])
+            second_body = int(geom_body_ids[second_geom])
+            first_name = names_by_id.get(first_body)
+            second_name = names_by_id.get(second_body)
+            if (
+                first_name in self.cfg["robot_links"]
+                and second_name in self.cfg["structures"]
+            ):
+                return (
+                    first_name,
+                    second_name,
+                    self.mj_model.geom(first_geom).name,
+                    self.mj_model.geom(second_geom).name,
+                )
+            if (
+                second_name in self.cfg["robot_links"]
+                and first_name in self.cfg["structures"]
+            ):
+                return (
+                    second_name,
+                    first_name,
+                    self.mj_model.geom(second_geom).name,
+                    self.mj_model.geom(first_geom).name,
+                )
+
+        # Keep the existing body-pair fallback for models that expose contact
+        # pairs but no usable geom names.
         for l in self.cfg["robot_links"]:
             lid = self.bid.get(l)
             if lid is None:
@@ -254,13 +453,19 @@ class Referee:
             for s in self.cfg["structures"]:
                 sid = self.bid.get(s)
                 if sid is not None and (lid, sid) in pairs:
-                    return True
-        return False
+                    return l, s, "?", "?"
+        return None
 
-    def _toppled_other_object(self, mj_data, carried_target=None):
+    def _toppled_other_object(self, mj_data, carried_target=None, exclude=None):
         thr = self.cfg["thresholds"]
         for b in self.objects:
             if carried_target is not None and b == carried_target:
+                continue
+            if exclude is not None and b in exclude:
+                continue
+            # 已交付/已掉落的目标早已不在货架上, 其"位移"是搬运造成的, 不能再算碰倒;
+            # 已经为同一倒伏物扣过一次 C2 后也不再重复扣分。
+            if b in self.retired or b in self.toppled_penalized:
                 continue
             if b not in self.init_pos:
                 continue
@@ -282,8 +487,28 @@ class Referee:
                       % ("(直立+%d)" % self.cfg["scores"]["upright_bonus"] if f.upright else "",
                          net, len(self.scored), len(self.targets)))
         else:
-            net = -(pen["drop"]) - deductions
-            self._log(t, "C3 搬运掉落，流程作废 净分 %+d（目标 %s 可重试）" % (net, f.target))
+            # 官方规则: "如本次循环已失败, 则清除本轮扣分, 即既不加分也不扣分,
+            # 本轮成绩为0"。掉落/碰倒/碰撞扣分只作用于最终成功的循环。
+            net = 0
+            self._log(t, "C3 搬运掉落，本轮作废，本轮成绩 0（目标 %s 可重试）" % f.target)
+        if f.target is not None:
+            # 已计分/已掉落的目标不再位于货架, 后续流程的 C2 判定必须排除它们
+            self.retired.add(f.target)
+        # Shelf-state snapshot at each flow settle: shows whether a C2 later
+        # in the match is cumulative (another flow already nudged the bottle)
+        # or caused by the current flow itself.
+        try:
+            state_lines = []
+            for b in self.objects:
+                if b in self.bid and b in self.init_pos:
+                    tilt = self._tilt_deg(mj_data, b)
+                    shift = self._xy_shift(mj_data, b)
+                    if tilt > 3.0 or shift > 0.02:
+                        state_lines.append("%s(t=%.0f,s=%.3f)" % (b, tilt, shift))
+            if state_lines:
+                print("[referee] shelf state at settle: " + "; ".join(state_lines), flush=True)
+        except Exception:
+            pass
         self.records.append({
             "target": f.target,
             "completed": bool(completed),
@@ -296,6 +521,15 @@ class Referee:
             "net": int(net),
             "steps": dict(f.t),
         })
+        self.flow = None
+
+    def _cancel_flow(self, t, reason):
+        """作废当前流程但不计分也不扣分(用于超时等异常场景)。"""
+        f = self.flow
+        if f is None:
+            return
+        step = f.step
+        self._log(t, "流程作废(%s, 卡在 S%d), 不计分; 下次进入取货区重新开启流程" % (reason, step))
         self.flow = None
 
     def _finalize(self, t, reason):

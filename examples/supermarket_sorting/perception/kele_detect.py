@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-kele perception node for the Supermarket Sorting task.
+Multi-class perception node for the Supermarket Sorting task.
 
 Mirrors the reference material_detection_client/yolo_detect.py architecture
-but is specialised for the kele bottle and outputs poses in the WORLD frame
-(the client consumes world-frame targets directly via arm_to()).
+and outputs poses in the WORLD frame (the client consumes world-frame
+targets directly via arm_to()).
 
 Pipeline
 --------
@@ -17,8 +17,8 @@ Pipeline
         v  pixel2cam: deproject (u,v,depth) with K  -> camera-frame point
         v  T_cam_world @ p_cam (MMK2FK headeye site) -> WORLD point
         |
-        v  publish /kele/detections (vision_msgs/Detection3DArray, world frame)
-           publish /kele/result_image (debug overlay)
+        v  publish /supermarket_sorting/detections (vision_msgs/Detection3DArray, world frame)
+           publish /supermarket_sorting/result_image (debug overlay)
 
 The camera->world transform uses the repo's MMK2FK.get_head_camera_pose(),
 fed with the live base pose (odom) + slide/head joints (joint_states).  The
@@ -29,6 +29,7 @@ deprojected point maps to world with NO extra axis swap (validated to
 
 import os
 import argparse
+import json
 from pathlib import Path
 import numpy as np
 import cv2
@@ -40,17 +41,24 @@ from cv_bridge import CvBridge
 from sensor_msgs.msg import Image, CameraInfo, JointState
 from nav_msgs.msg import Odometry
 from vision_msgs.msg import Detection3DArray, Detection3D, ObjectHypothesisWithPose
+from std_msgs.msg import String
 
 from discoverse.robots.mmk2.mmk2_fk import MMK2FK
 
 from backends import GtProjectionBackend, BlobBackend, YoloBackend
+from inventory import associate_detections_to_markers
 
 LAYOUT_JSON = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "..", "retail_competition_layout.json")
 RUNTIME_LAYOUT_JSON = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                   "..", "runtime_layout.json")
 DEFAULT_CKPT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                            "checkpoints", "kele.pt")
+                            "checkpoints", "supermarket_multiclass.pt")
+MAX_RGB_DEPTH_SKEW_SEC = float(os.getenv("SUPERMARKET_RGB_DEPTH_SKEW_SEC", "0.12"))
+DETECTIONS_TOPIC = os.getenv("SUPERMARKET_DETECTIONS_TOPIC", "/supermarket_sorting/detections").strip() or "/supermarket_sorting/detections"
+LEGACY_DETECTIONS_TOPIC = os.getenv("SUPERMARKET_LEGACY_DETECTIONS_TOPIC", "/kele/detections").strip() or "/kele/detections"
+RESULT_IMAGE_TOPIC = os.getenv("SUPERMARKET_RESULT_IMAGE_TOPIC", "/supermarket_sorting/result_image").strip() or "/supermarket_sorting/result_image"
+LEGACY_RESULT_IMAGE_TOPIC = os.getenv("SUPERMARKET_LEGACY_RESULT_IMAGE_TOPIC", "/kele/result_image").strip() or "/kele/result_image"
 
 
 def resolve_layout_path():
@@ -75,6 +83,7 @@ class KeleDetectNode(Node):
         # camera intrinsics (from camera_info)
         self.K = None
         self._depth_msg = None
+        self._depth_stamp_sec = None
 
         # live robot state for the camera->world transform
         self.fk = MMK2FK()
@@ -89,10 +98,40 @@ class KeleDetectNode(Node):
         if backend == "gt":
             self.detector = GtProjectionBackend(self.layout_path)
         elif backend == "yolo":
-            self.detector = YoloBackend(DEFAULT_CKPT)
+            weights = (
+                os.getenv("SUPERMARKET_BASELINE_WEIGHTS", "").strip()
+                or os.getenv("SUPERMARKET_YOLO_WEIGHTS", "").strip()
+                or DEFAULT_CKPT
+            )
+            self.detector = YoloBackend(os.path.expanduser(weights))
         else:
             self.detector = BlobBackend()
+        if (
+            backend == "yolo"
+            and os.getenv("SUPERMARKET_ORDER", "official").strip().lower() == "official"
+            and not getattr(self.detector, "is_official_multiclass", False)
+            and os.getenv("SUPERMARKET_ALLOW_SINGLE_CLASS", "0") != "1"
+        ):
+            raise RuntimeError(
+                "official anonymous mode requires a nine-class YOLO checkpoint "
+                "with the official product names; use SUPERMARKET_ALLOW_SINGLE_CLASS=1 "
+                "only for a non-scoring development test"
+            )
         self.get_logger().info(f"kele_detect up; backend={backend}; layout={self.layout_path}")
+        if backend == "gt" and os.getenv("SUPERMARKET_ALLOW_RUNTIME_LAYOUT", "0") != "1":
+            # The GT backend projects STATIC layout positions. If the server
+            # randomized the scene, every projection silently lands on the
+            # wrong slot. The smoke-test script sets the flag; manual runs
+            # must too, so fail loudly instead of producing wrong data.
+            self.get_logger().warn(
+                "[gt] reading the STATIC layout while the server may have "
+                "randomized product positions (SUPERMARKET_RANDOMIZE). Set "
+                "SUPERMARKET_ALLOW_RUNTIME_LAYOUT=1 to project the live "
+                "runtime layout for development tests."
+            )
+        self.aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
+        self.aruco_params = cv2.aruco.DetectorParameters()
+        self.aruco_detector = cv2.aruco.ArucoDetector(self.aruco_dict, self.aruco_params)
 
         # subscriptions
         self.create_subscription(CameraInfo, "/head_camera/color/camera_info",
@@ -106,8 +145,12 @@ class KeleDetectNode(Node):
                                  self.odom_cb, 10)
 
         # publishers
-        self.det_pub = self.create_publisher(Detection3DArray, "/kele/detections", 10)
-        self.img_pub = self.create_publisher(Image, "/kele/result_image", 5)
+        self.det_pub = self.create_publisher(Detection3DArray, DETECTIONS_TOPIC, 10)
+        self.legacy_det_pub = self.create_publisher(Detection3DArray, LEGACY_DETECTIONS_TOPIC, 10)
+        self.inventory_pub = self.create_publisher(String, "/supermarket_sorting/inventory_observations", 10)
+        self.img_pub = self.create_publisher(Image, RESULT_IMAGE_TOPIC, 5)
+        self.legacy_img_pub = self.create_publisher(Image, LEGACY_RESULT_IMAGE_TOPIC, 5)
+        self.last_detection_log = 0.0
 
     # ---- state callbacks ----
     def camera_info_cb(self, msg: CameraInfo):
@@ -115,6 +158,12 @@ class KeleDetectNode(Node):
 
     def depth_cb(self, msg: Image):
         self._depth_msg = msg
+        self._depth_stamp_sec = self._stamp_sec(msg)
+
+    @staticmethod
+    def _stamp_sec(msg):
+        stamp = msg.header.stamp
+        return float(stamp.sec) + float(stamp.nanosec) * 1e-9
 
     def js_cb(self, msg: JointState):
         jp = {n: msg.position[i] for i, n in enumerate(msg.name) if i < len(msg.position)}
@@ -166,6 +215,16 @@ class KeleDetectNode(Node):
     def rgb_cb(self, msg: Image):
         if self.K is None or self._depth_msg is None:
             return
+        rgb_stamp_sec = self._stamp_sec(msg)
+        if (
+            self._depth_stamp_sec is not None
+            and rgb_stamp_sec > 0.0
+            and self._depth_stamp_sec > 0.0
+            and abs(rgb_stamp_sec - self._depth_stamp_sec) > MAX_RGB_DEPTH_SKEW_SEC
+        ):
+            # A moving head with mismatched RGB/depth frames creates a world
+            # point that can be centimetres off. Wait for the matching frame.
+            return
         T_cam_world = self.camera_world_tmat()
         if T_cam_world is None:
             return
@@ -177,7 +236,7 @@ class KeleDetectNode(Node):
 
         out = []
         vis = rgb.copy() if self.pub_res_img else rgb
-        for d in dets:
+        for det_index, d in enumerate(dets):
             u, v = int(d["x"]), int(d["y"])
             depth_m = self.patch_depth_m(depth, u, v)
             if depth_m <= 0.0:
@@ -185,7 +244,12 @@ class KeleDetectNode(Node):
             p_cam = self.pixel_to_cam(u, v, depth_m)
             p_world = (T_cam_world @ np.array([p_cam[0], p_cam[1], p_cam[2], 1.0]))[:3]
 
-            rec = {"class": d["class"], "conf": d.get("conf", 0.0), "world": p_world}
+            rec = {
+                "class": d["class"],
+                "conf": d.get("conf", 0.0),
+                "world": p_world,
+                "source_index": det_index,
+            }
             # coord-bridge validation logging (GT backend only)
             if "gt_world_pos" in d:
                 err = np.linalg.norm(p_world - d["gt_world_pos"]) * 1e3
@@ -204,8 +268,17 @@ class KeleDetectNode(Node):
                             0.5, (0, 255, 0), 1)
 
         self.publish_detections(out, msg.header.stamp)
+        self.publish_inventory_observations(rgb, dets, out, depth, T_cam_world, rgb_stamp_sec)
+        now = self.get_clock().now().nanoseconds * 1e-9
+        if now - self.last_detection_log > 1.0:
+            self.get_logger().info(
+                f"[perception_debug] raw={len(dets)} published={len(out)} backend={self.backend_name}"
+            )
+            self.last_detection_log = now
         if self.pub_res_img:
-            self.img_pub.publish(self.bridge.cv2_to_imgmsg(vis, "bgr8"))
+            image_msg = self.bridge.cv2_to_imgmsg(vis, "bgr8")
+            self.img_pub.publish(image_msg)
+            self.legacy_img_pub.publish(image_msg)
 
     def publish_detections(self, recs, stamp):
         msg = Detection3DArray()
@@ -223,15 +296,73 @@ class KeleDetectNode(Node):
             det.results.append(hyp)
             msg.detections.append(det)
         self.det_pub.publish(msg)
+        self.legacy_det_pub.publish(msg)
+
+    def publish_inventory_observations(self, rgb, detections, records, depth, T_cam_world, stamp_sec):
+        """Publish only unambiguous product-to-visible-marker observations."""
+        gray = cv2.cvtColor(rgb, cv2.COLOR_BGR2GRAY)
+        corners, ids, _ = self.aruco_detector.detectMarkers(gray)
+        if ids is None or not records:
+            return
+        markers = [
+            {"id": int(marker_id), "corners": corner.reshape(-1, 2).tolist()}
+            for marker_id, corner in zip(ids.flatten(), corners)
+            if 0 <= int(marker_id) <= 44
+        ]
+        if not markers:
+            return
+        by_source = {record["source_index"]: record for record in records}
+        # Only depth-valid detections may claim a marker. A raw detection whose
+        # depth was rejected would otherwise consume the marker and starve the
+        # correct, depth-valid observation for the same slot.
+        indexed_valid = [
+            (index, det)
+            for index, det in enumerate(detections)
+            if index in by_source
+        ]
+        filtered = [det for _, det in indexed_valid]
+        source_of_filtered = [index for index, _ in indexed_valid]
+        observations = []
+        for match in associate_detections_to_markers(filtered, markers):
+            source_index = source_of_filtered[match["detection_index"]]
+            record = by_source.get(source_index)
+            if record is None:
+                continue
+            marker = next(marker for marker in markers if marker["id"] == match["aruco_id"])
+            marker_corners = np.asarray(marker["corners"], dtype=float)
+            marker_u, marker_v = np.mean(marker_corners, axis=0).astype(int)
+            marker_depth_m = self.patch_depth_m(depth, int(marker_u), int(marker_v))
+            marker_world = None
+            if marker_depth_m > 0.0:
+                marker_cam = self.pixel_to_cam(marker_u, marker_v, marker_depth_m)
+                marker_world = (T_cam_world @ np.array([
+                    marker_cam[0], marker_cam[1], marker_cam[2], 1.0,
+                ]))[:3]
+            observations.append({
+                "aruco_id": match["aruco_id"],
+                "kind": record["class"],
+                "confidence": float(record["conf"]),
+                "association_score": float(match["score"]),
+                "world": [float(value) for value in record["world"]],
+                "marker_world": (
+                    None if marker_world is None
+                    else [float(value) for value in marker_world]
+                ),
+                "stamp": float(stamp_sec),
+            })
+        if observations:
+            payload = String()
+            payload.data = json.dumps({"schema_version": 1, "observations": observations})
+            self.inventory_pub.publish(payload)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="kele perception node")
+    parser = argparse.ArgumentParser(description="supermarket perception node")
     parser.add_argument("--backend", default="blob",
                         choices=["blob", "gt", "yolo"],
                         help="2-D detector backend (default: blob)")
     parser.add_argument("--no-result-image", action="store_true",
-                        help="disable /kele/result_image publishing")
+        help="disable result image publishing")
     args = parser.parse_args()
 
     rclpy.init()
@@ -242,7 +373,8 @@ def main():
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":

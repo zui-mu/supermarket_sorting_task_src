@@ -1,5 +1,7 @@
+import math
 import threading
 import numpy as np
+import threading
 from scipy.spatial.transform import Rotation
 
 import rclpy
@@ -15,6 +17,22 @@ from sensor_msgs.msg import Image, CameraInfo, JointState, Imu, LaserScan
 from discoverse.robots_env.mmk2_base import MMK2Base, MMK2Cfg
 from discoverse.utils import PIDarray, camera2k, get_site_tmat
 
+# ---- headless/test robustness: never let a GLFW window close the sim ----
+# discoverse's simulator render loop does:
+#     if glfw.window_should_close(self.window): self.running = False
+# Under WSLg / flaky rendering contexts the window can report "should close"
+# spuriously, which silently ends the whole simulation (the client keeps
+# waiting while the server exits - verified: server Exited(0) right after
+# "referee results saved", client logs stale odom for the rest of the run).
+# We patch window_should_close BEFORE discoverse's renderer ever polls it, so
+# the physics loop only stops on rclpy.ok() (Ctrl-C / ROS shutdown).
+try:
+    import glfw as _glfw
+    _glfw_should_close_orig = _glfw.window_should_close
+    _glfw.window_should_close = lambda _window: False
+except Exception as _exc:  # pragma: no cover - windowless server
+    _glfw_should_close_orig = None
+
 class MMK2ROS2(MMK2Base, Node):
     target_control = np.zeros(19)
     def __init__(self, config: MMK2Cfg):
@@ -28,6 +46,10 @@ class MMK2ROS2(MMK2Base, Node):
 
         super().__init__(config)
         Node.__init__(self, 'MMK2_mujoco_node')
+        # MuJoCo's MjData is not thread-safe.  The physics loop mutates it
+        # while the optional lidar wrapper traces rays against it, so those
+        # two operations must never run concurrently.
+        self._physics_lock = threading.RLock()
 
         self.pid_base_vel = PIDarray(
             kps=np.array([ 7.5 ,  7.5 ]),
@@ -41,7 +63,7 @@ class MMK2ROS2(MMK2Base, Node):
 
         if self.config.lidar_s2_sim:
             self._init_lidar_sensor()
-            if not getattr(self, "lidar_s2", None):
+            if not getattr(self, "_lidar_api", None):
                 self.config.lidar_s2_sim = False
 
     def _init_lidar_sensor(self):
@@ -49,28 +71,34 @@ class MMK2ROS2(MMK2Base, Node):
 
         Different official images expose slightly different mujoco_lidar
         signatures. We try the named form first, then positional forms, and
-        disable lidar gracefully if the package is incompatible.
+        finally fall back to a self-contained mj_ray implementation; if all
+        fail the lidar is disabled gracefully.
         """
+        self.lidar_frame_id = "laser"
         try:
             from mujoco_lidar.lidar_wrapper import MjLidarWrapper
             from mujoco_lidar.scan_gen import create_lidar_single_line
         except Exception as exc:
-            self.get_logger().warn("[server] mujoco_lidar import failed; lidar disabled: %s" % exc)
+            self.get_logger().warn("[server] mujoco_lidar import failed: %s" % exc)
             self.lidar_s2 = None
             return
 
-        self.lidar_frame_id = "laser"
         self.rays_theta, self.rays_phi = create_lidar_single_line(360, np.pi * 2.0)
 
         wrapper = None
+        self._lidar_api = None
         init_errors = []
-        for args, kwargs in (
-            ((self.mj_model, self.mj_data), {"site_name": self.lidar_frame_id}),
-            ((self.mj_model, self.mj_data, self.lidar_frame_id), {}),
-            ((self.mj_model, self.mj_data), {}),
+        # The V2 server image exposes the current mujoco_lidar API:
+        # MjLidarWrapper(model, site_name, backend=...) plus trace_rays().
+        # Keep the legacy call forms after it for older training images.
+        for args, kwargs, api in (
+            ((self.mj_model, self.lidar_frame_id), {"backend": "cpu"}, "trace_rays"),
+            ((self.mj_model, self.mj_data), {"site_name": self.lidar_frame_id}, "get_lidar_points"),
+            ((self.mj_model, self.mj_data, self.lidar_frame_id), {}, "get_lidar_points"),
         ):
             try:
                 wrapper = MjLidarWrapper(*args, **kwargs)
+                self._lidar_api = api
                 break
             except TypeError as exc:
                 init_errors.append(str(exc))
@@ -87,10 +115,87 @@ class MMK2ROS2(MMK2Base, Node):
             return
 
         self.lidar_s2 = wrapper
-        self.lidar_s2.get_lidar_points(self.rays_phi, self.rays_theta, self.mj_data)
+        # Sanity-check one trace from the open start pocket. The CPU backend
+        # of some mujoco_lidar builds constructs fine but returns distances of
+        # a few centimetres for every ray (verified: max 0.024 m in an open
+        # arena), which silently disables every client-side avoidance sector.
+        # Fall back to our own mj_ray implementation in that case.
+        healthy = False
+        with self._physics_lock:
+            try:
+                if self._lidar_api == "trace_rays":
+                    probe = np.asarray(
+                        self.lidar_s2.trace_rays(self.mj_data, self.rays_theta, self.rays_phi),
+                        dtype=float,
+                    )
+                else:
+                    probe = np.asarray(
+                        self.lidar_s2.get_lidar_points(self.rays_phi, self.rays_theta, self.mj_data),
+                        dtype=float,
+                    )
+                healthy = bool(np.nanmax(probe) > 1.0)
+            except Exception as exc:
+                self.get_logger().warn("[server] lidar probe trace failed: %s" % exc)
+        if healthy:
+            self.get_logger().info("[server] lidar wrapper trace verified (max=%.1f m)" % float(np.nanmax(probe)))
+        else:
+            self.get_logger().warn(
+                "[server] lidar wrapper returned unusable ranges; "
+                "falling back to the built-in mj_ray scanner")
+            self.lidar_s2 = None
+            self._lidar_api = "mj_ray"
+            import mujoco
+            self._mj_ray_chassis_body = None
+            # mj_ray's bodyexclude does NOT cover the subtree (verified), so
+            # the chassis body itself (agv_link) must be excluded: the lidar
+            # site sits on the chassis and otherwise every ray self-hits at
+            # ~0.02 m, killing all avoidance sectors.
+            for name in ("agv_link", "mmk2"):
+                try:
+                    self._mj_ray_chassis_body = int(mujoco.mj_name2id(
+                        self.mj_model, mujoco.mjtObj.mjOBJ_BODY, name))
+                    break
+                except Exception:
+                    continue
 
         self.static_broadcaster = tf2_ros.StaticTransformBroadcaster(self)
         self.publish_static_transform(header_frame_id='base_link', child_frame_id=self.lidar_frame_id)
+
+    def _scan_with_mj_ray(self):
+        """CPU lidar fallback: cast 360 rays with MuJoCo's mj_ray.
+
+        Returns distances aligned with ``self.rays_theta`` (no hits are -1.0).
+
+        Only geom group 0 is cast against: the scene's collision geoms
+        (shelves, walls, table, boxes) are all group 0, while the robot's own
+        collision geoms are group 4 and its visual meshes are non-zero groups.
+        ``bodyexclude=agv_link`` alone still left the ARM links in the cloud at
+        0.3-1.0 m (the start-pose front sector read 0.98 m in an open aisle),
+        which enclosed the A* start cell with self-hits.
+        """
+        import mujoco
+
+        site = self.mj_data.site(self.lidar_frame_id)
+        pnt = site.xpos.copy()
+        base_mat = np.asarray(self.mj_data.body("agv_link").xmat, dtype=float).reshape(3, 3)
+        yaw = math.atan2(base_mat[1, 0], base_mat[0, 0])
+        dists = np.empty(len(self.rays_theta), dtype=float)
+        exclude = getattr(self, "_mj_ray_chassis_body", -1) or -1
+        # Only geom group 0 (the scene's collision geoms). The robot's own
+        # collision geoms are group 4 and its visual meshes are non-zero
+        # groups, so this removes the carried arm from the cloud; the binding
+        # wants a 6-byte mask like mjvOption, not a scalar bitmask.
+        group_mask = np.array([1, 0, 0, 0, 0, 0], dtype=np.uint8)
+        for index, theta in enumerate(self.rays_theta):
+            angle = yaw + float(theta)
+            vec = np.array([math.cos(angle), math.sin(angle), 0.0], dtype=float)
+            dist = mujoco.mj_ray(
+                self.mj_model, self.mj_data, pnt, vec,
+                geomgroup=group_mask, flg_static=True, bodyexclude=exclude,
+                geomid=None,
+            )
+            dists[index] = -1.0 if dist is None or dist < 0 else float(dist)
+        return dists
 
     def init_topic_publisher(self):
         self.tf_broadcaster = tf2_ros.TransformBroadcaster(self)
@@ -246,15 +351,23 @@ class MMK2ROS2(MMK2Base, Node):
             return
                       
         rate = self.create_rate(freq)
-        while rclpy.ok() and self.running:
-            points = self.lidar_s2.get_lidar_points(self.rays_phi, self.rays_theta, self.mj_data)
-            dists = np.linalg.norm(points[:, :2], axis=1)
-            if np.all(dists < 1e-6):
-                range_min = 0.0
-            else:
-                range_min = np.min(dists[dists >= 1e-6])
-            range_max = np.max(dists)
-
+        while rclpy.ok():
+            # The renderer can flip running=False once (see module docstring);
+            # that must not permanently kill lidar publishing, or the client
+            # sees a dead laser while the match is still running.
+            if not self.running:
+                self.running = True
+            with self._physics_lock:
+                if self._lidar_api == "mj_ray":
+                    dists = self._scan_with_mj_ray()
+                elif self._lidar_api == "trace_rays":
+                    dists = np.asarray(
+                        self.lidar_s2.trace_rays(self.mj_data, self.rays_theta, self.rays_phi),
+                        dtype=float,
+                    )
+                else:
+                    points = self.lidar_s2.get_lidar_points(self.rays_phi, self.rays_theta, self.mj_data)
+                    dists = np.linalg.norm(points[:, :2], axis=1)
             scan_msg = LaserScan()
             scan_msg.header.frame_id = self.lidar_frame_id
             scan_msg.header.stamp = self.get_clock().now().to_msg()
@@ -262,17 +375,31 @@ class MMK2ROS2(MMK2Base, Node):
             scan_msg.angle_max = float(-np.pi * 179. / 180.)
             scan_msg.angle_increment = float(-2. * np.pi / 360.)
             scan_msg.time_increment = 0.0
-            scan_msg.range_min = float(range_min)
-            scan_msg.range_max = float(range_max)
-            scan_msg.ranges = dists[::-1].astype(np.float32).tolist()
+            # Official V2 interface metadata: 360 points at 12 Hz, min valid
+            # range 0.02 m, max valid range 12 m. Report the advertised range
+            # instead of the per-frame measured extents so client-side range
+            # gates behave identically against the official server.
+            scan_msg.range_min = 0.02
+            scan_msg.range_max = 12.0
+            scan_msg.ranges = np.where(dists < 0.02, float("inf"), dists)[::-1].astype(np.float32).tolist()
             scan_msg.intensities = []
 
             self.lidar_s2_puber.publish(scan_msg)
             rate.sleep()
 
+    def physics_step(self):
+        """Advance MuJoCo without racing the optional lidar tracing thread."""
+        with self._physics_lock:
+            self.step(self.target_control)
+
     def thread_pubros2topic(self, freq=30):
         rate = self.create_rate(freq)
-        while rclpy.ok() and self.running:
+        while rclpy.ok():
+            # Same resilience as the lidar thread: a single running=False
+            # (transient renderer hiccup) must not end odometry/joint
+            # publishing for the rest of the match.
+            if not self.running:
+                self.running = True
             time_stamp = self.get_clock().now().to_msg()
 
             self.joint_state.header.stamp = time_stamp
@@ -382,8 +509,44 @@ if __name__ == "__main__":
     pubtopic_thread = threading.Thread(target=exec_node.thread_pubros2topic, args=(30,))
     pubtopic_thread.start()
 
-    while rclpy.ok() and exec_node.running:
-        exec_node.step(exec_node.target_control)
+    now_guard = 0
+    loop_failures = 0
+
+    # Belt and suspenders for headless verification: if the base ever flips
+    # running=False for a reason other than rclpy shutdown (e.g. a rendering
+    # hiccup that bypassed the glfw patch), keep the physics alive and say so.
+    # The client depends on the server's odometry for its whole test window.
+    while rclpy.ok():
+        if not exec_node.running:
+            exec_node.running = True
+            if now_guard % 240 == 0:
+                exec_node.get_logger().warn(
+                    "[server] exec_node.running flipped False while ROS is up; "
+                    "re-asserting and continuing physics (headless verification)")
+            now_guard += 1
+        try:
+            exec_node.physics_step()
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            # Same policy as the scoring server main loop: a transient
+            # physics/render failure (mj_step already advanced before render)
+            # must not kill the whole simulation.  Log rate-limited, keep
+            # stepping; give up only on a pathological consecutive streak.
+            loop_failures += 1
+            if loop_failures == 1 or loop_failures % 240 == 0:
+                exec_node.get_logger().warn(
+                    "[server] physics step failed (%d consecutive): %r"
+                    % (loop_failures, exc))
+                if loop_failures <= 240:
+                    import traceback
+                    traceback.print_exc()
+            if loop_failures >= 20000:
+                exec_node.get_logger().error(
+                    "[server] too many consecutive physics failures; ending run")
+                break
+            continue
+        loop_failures = 0
 
     exec_node.destroy_node()
     rclpy.shutdown()

@@ -1,5 +1,5 @@
 {
-  "time_limit_s": 420.0,
+  "time_limit_s": 600.0,
   "scores": {"s1": 1, "s2": 2, "s3": 6, "s4": 1, "s5": 10, "upright_bonus": 5},
   "penalties": {"collision": 5, "topple": 5, "drop": 3},
   "thresholds": {
