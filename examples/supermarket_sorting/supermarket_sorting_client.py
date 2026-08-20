@@ -282,8 +282,15 @@ PLACE_RAISE_LATERAL_SCALES = tuple(
 # box slides out of the bottle footprint before the release settles. 7 cm is
 # the verified complete clearing (run 63's upright landing). A slower reverse
 # shoves the bottle less.
-PLACE_REVERSE_DISTANCE = float(os.getenv("SUPERMARKET_PLACE_REVERSE_DISTANCE", "0.07"))
+PLACE_REVERSE_DISTANCE = float(os.getenv("SUPERMARKET_PLACE_REVERSE_DISTANCE", "0.25"))
 PLACE_REVERSE_SPEED = float(os.getenv("SUPERMARKET_PLACE_REVERSE_SPEED", "0.025"))
+# POST_PLACE_EGRESS (round 61): after the open, the EMPTY arm is tucked to
+# the low slide + INIT_ARM_R while the base reverses, so the next-task turn
+# has minimal sweep and cannot knock the just-placed bottle (the old 7 cm
+# reverse left the whole arm in the danger zone; audit confirmed the risk).
+PLACE_EGRESS_SLIDE = float(os.getenv("SUPERMARKET_PLACE_EGRESS_SLIDE", "0.10"))
+PLACE_EGRESS_CLEAR_EE_Z = float(os.getenv("SUPERMARKET_PLACE_EGRESS_CLEAR_EE_Z", "0.95"))
+PLACE_EGRESS_TIMEOUT = float(os.getenv("SUPERMARKET_PLACE_EGRESS_TIMEOUT", "6.0"))
 # Westmost x allowed for a loaded-descent waypoint (the arm's lateral extent
 # makes anything further west scrape the perimeter wall on the waypoint turn).
 DELIVERY_MIN_SAFE_WEST_X = float(os.getenv("SUPERMARKET_DELIVERY_MIN_SAFE_WEST_X", "-1.95"))
@@ -1027,11 +1034,13 @@ DELIVERY_GOAL = np.array([
 # land on/near the previously placed bottle.  All values keep the base inside
 # the S5 box footprint x[-2.42,-1.46].  A y-stagger was tried (round 59) but
 # v72 showed it broke the upright release (+20 instead of +25 on every item):
-# the base standoff moved north, changing the release geometry.  Keep the
-# proven x-only stagger (v70 4/5 max score with the same fixed x pattern).
+# the base standoff moved north, changing the release geometry.  Round 61:
+# five UNIQUE x spots (item 4/5 previously reused item 2/3 spots, which risks
+# knocking the already-placed bottle when the next one is lowered); 8 cm
+# spacing keeps all five inside the box with 4 cm of boundary margin.
 PLACE_X_OFFSETS = tuple(
     float(v) for v in os.getenv("SUPERMARKET_PLACE_X_OFFSETS",
-                                "0.0,0.12,0.24,0.12,0.24").split(",")
+                                "0.0,0.08,0.16,0.24,0.32").split(",")
 )
 PLACE_Y_OFFSETS = (0.0,) * len(PLACE_X_OFFSETS)
 DELIVERY_FINAL_APPROACH_RADIUS = float(os.getenv("SUPERMARKET_DELIVERY_FINAL_APPROACH_RADIUS", "0.65"))
@@ -1289,6 +1298,7 @@ class PickPlaceClient(Node):
         self.place_roll_target = 0.0
         self.place_clear_done = False
         self.place_reverse_start = None
+        self.place_egress_started = None
         self.place_arm_slew = PLACE_ARM_SLEW
         self.place_arm_slow = False
         self.place_arm_raise_active = False
@@ -3983,14 +3993,23 @@ class PickPlaceClient(Node):
                 self.phase != NAV_TABLE or getattr(self, "recovery_escape", False)
             ):
                 self.recovery_state = "rotate"
-                rotate_time = DELIVERY_RECOVERY_ROTATE_TIME if self.phase == NAV_TABLE else STUCK_RECOVERY_TIME * 0.55
                 if getattr(self, "recovery_escape", False):
-                    # Escape mode: the short rotate only re-faces the pinned
-                    # box.  Turn for a full 180 degrees so the next approach
-                    # comes from the opposite side (the long reverse already
-                    # cleared the box).
-                    rotate_time = 4.0
-                self.recovery_until = self.now() + rotate_time
+                    # Angle-closed-loop 180-degree turn: target yaw = start
+                    # ± pi, tracked by odometry, not a blind timed spin
+                    # (round 61: the fixed 4 s spin plus later recovery spins
+                    # looked like a 360-degree loop).  Hard safety cap bounds.
+                    start_yaw = float(self.base_yaw)
+                    self.recovery_turn_start_yaw = start_yaw
+                    self.recovery_turn_target_yaw = wrap_to_pi(
+                        start_yaw + math.pi * self.recovery_turn_sign)
+                    self.recovery_until = self.now() + 8.0
+                    self.get_logger().info(
+                        f"[nav_recovery] escape rotate to target yaw "
+                        f"{self.recovery_turn_target_yaw:.2f} (start {start_yaw:.2f})")
+                else:
+                    rotate_time = DELIVERY_RECOVERY_ROTATE_TIME if self.phase == NAV_TABLE else STUCK_RECOVERY_TIME * 0.55
+                    self.recovery_until = self.now() + rotate_time
+                    self.recovery_turn_target_yaw = None
             else:
                 # A blind in-place turn sweeps the loaded elbow through the
                 # obstacle that caused the stop. Replan after backing out.
@@ -4008,23 +4027,29 @@ class PickPlaceClient(Node):
                 self.set_twist(0.0, 0.0)
                 return False
         if self.recovery_state == "reverse":
-            if self.rear_blocked_now() and not getattr(self, "recovery_escape", False):
-                # Backing into an obstacle only worsens the recovery. Skip the
-                # reverse phase and rotate in place instead.  Escape mode does
-                # NOT skip: when front/left/right are all pinned the only free
-                # direction is behind, and the long reverse is what actually
-                # separates the chassis from the box (round 58: diagonal box).
-                rotate_time = (
-                    DELIVERY_RECOVERY_ROTATE_TIME
-                    if self.phase == NAV_TABLE
-                    else STUCK_RECOVERY_TIME * 0.55
-                )
-                self.recovery_state = "rotate"
-                self.recovery_until = self.now() + rotate_time
-                self.get_logger().warn(
-                    "[nav_recovery] rear blocked; skipping reverse and rotating")
-                return True
-            self.set_twist(self.recovery_linear, 0.0)
+            if self.rear_blocked_now():
+                if not getattr(self, "recovery_escape", False):
+                    # Backing into an obstacle only worsens the recovery. Skip
+                    # the reverse phase and rotate in place instead.
+                    rotate_time = (
+                        DELIVERY_RECOVERY_ROTATE_TIME
+                        if self.phase == NAV_TABLE
+                        else STUCK_RECOVERY_TIME * 0.55
+                    )
+                    self.recovery_state = "rotate"
+                    self.recovery_until = self.now() + rotate_time
+                    self.recovery_turn_target_yaw = None
+                    self.get_logger().warn(
+                        "[nav_recovery] rear blocked; skipping reverse and rotating")
+                    return True
+                # Escape mode: rear is tight but the chassis must still separate
+                # from the pinned box.  Slow the reverse (half speed, capped)
+                # so a rear obstacle is nudged instead of slammed (round 61
+                # audit: the 0.22 m/s long reverse bypassed the rear check).
+                slow_reverse = max(self.recovery_linear * 0.5, -0.10)
+                self.set_twist(slow_reverse, 0.0)
+            else:
+                self.set_twist(self.recovery_linear, 0.0)
         else:
             if self.phase == NAV_TABLE:
                 # The loaded recovery rotate must stay at the carry angular
@@ -4033,7 +4058,29 @@ class PickPlaceClient(Node):
                 _, turn_speed = self.delivery_speed_limits()
             else:
                 turn_speed = 0.65
-            self.set_twist(0.0, self.recovery_turn_sign * turn_speed)
+            target_yaw = getattr(self, "recovery_turn_target_yaw", None)
+            if target_yaw is not None:
+                yaw_err = wrap_to_pi(float(target_yaw) - float(self.base_yaw))
+                if abs(yaw_err) < 0.10 or self.now() >= self.recovery_until:
+                    # Reached the target heading (or the safety cap): stop
+                    # turning and let the next replan leave from this pose.
+                    self.recovery_state = "idle"
+                    self.recovery_until = 0.0
+                    self.recovery_turn_target_yaw = None
+                    self.last_nav_progress_xy = np.array(self.base_xy, dtype=float)
+                    self.last_nav_progress_time = self.now()
+                    self.nav_mode = "turn"
+                    if self.phase == NAV_TABLE:
+                        self.route_goal = self.delivery_goal_current.copy()
+                        self.route_purpose = "delivery"
+                        self.route_needs_plan = True
+                    else:
+                        self.route_needs_plan = True
+                    self.set_twist(0.0, 0.0)
+                    return False
+                self.set_twist(0.0, math.copysign(turn_speed, yaw_err))
+            else:
+                self.set_twist(0.0, self.recovery_turn_sign * turn_speed)
         if self.grasp_was_confirmed and self.loaded_carry_hold is not None and self.phase == NAV_TABLE:
             self.hold_loaded_carry_pose(hold_slide=not self.place_pre_raise_active, hold_gripper=True, hold_right_arm=not self.loaded_arm_moving)
         return True
@@ -4701,6 +4748,8 @@ class PickPlaceClient(Node):
         self.recovery_state = "idle"
         self.recovery_linear = -0.18
         self.recovery_escape = False
+        self.recovery_turn_target_yaw = None
+        self.recovery_turn_start_yaw = None
         self.nav_recovery_count = 0
         self.front_blocked = False
         self.front_blocked_since = None
@@ -6145,9 +6194,12 @@ class PickPlaceClient(Node):
                         f"placement slide did not reach the release height (ee_z={ee_z:.3f})")
                     return
             elif self.place_sub == 1:
-                # Open fully and wait for both fingers to clear the bottle.
+                # Open fully, reverse the base, AND tuck the empty arm so the
+                # next-task turn cannot sweep the placed bottle
+                # (POST_PLACE_EGRESS, round 61).  The arm is EMPTY here (the
+                # bottle was released), so tucking it while reversing is safe.
                 if self.loaded_carry_hold is not None:
-                    self.hold_loaded_carry_pose(hold_slide=False, hold_gripper=False)
+                    self.hold_loaded_carry_pose(hold_slide=False, hold_gripper=False, hold_right_arm=False)
                 self.tc[18] = GRIP_OPEN
                 # Reverse the base north WHILE the fingers open: the
                 # finger-mount box (its long axis is north-south in the grasp
@@ -6159,14 +6211,32 @@ class PickPlaceClient(Node):
                 # touch pose).
                 if self.place_reverse_start is None:
                     self.place_reverse_start = np.array(self.base_xy, dtype=float)
+                    self.place_egress_started = self.now()
                     self.get_logger().info(
                         f"[place] reversing base north {PLACE_REVERSE_DISTANCE:.2f} m "
-                        f"during the open")
+                        f"while tucking the empty arm (egress)")
                 reverse_travel, reverse_done = self.place_reverse_progress()
                 if not reverse_done:
                     self.set_twist(-PLACE_REVERSE_SPEED, 0.0)
                 else:
                     self.set_twist(0.0, 0.0)
+                # Egress: raise/tuck the empty arm to low slide + INIT_ARM_R
+                # with the slow slew (fast tuck could fling the finger-mount
+                # box into the just-released bottle).
+                self.place_arm_slow = True
+                self.tc[2] = PLACE_EGRESS_SLIDE
+                self.tc[12:18] = list(INIT_ARM_R)
+                ee_z = float(self.ee_world()[2])
+                arm_err = float(np.max(np.abs(
+                    np.asarray(self.rarm_meas, dtype=float) - np.asarray(INIT_ARM_R))))
+                egress_ok = (
+                    float(self.slide_meas) <= 0.15
+                    and ee_z >= PLACE_EGRESS_CLEAR_EE_Z
+                ) or arm_err < 0.12
+                egress_timeout = (
+                    self.place_egress_started is not None
+                    and self.now() - self.place_egress_started > PLACE_EGRESS_TIMEOUT
+                )
                 # The gripper measurement can lag the physical open (and the
                 # referee, which scores S5 as soon as the bottle is released
                 # and settles).  count5_full_v40 froze here: "placement
@@ -6178,13 +6248,16 @@ class PickPlaceClient(Node):
                     self.now() - self.state_t0 >= PLACE_OPEN_DWELL
                     and reverse_done
                     and (self.rgripper_meas >= GRIPPER_OPEN_CONFIRM_POS or referee_completed_now)
+                    and (egress_ok or egress_timeout)
                 ):
                     self.place_sub = 2
                     self.loaded_carry_hold = None
+                    self.place_arm_slow = False
                     self.set_twist(0.0, 0.0)
                     self.get_logger().info(
-                        f"[place] gripper opened and reverse cleared "
-                        f"({reverse_travel:.3f} m); carry pose lock released")
+                        f"[place] gripper opened, reverse cleared ({reverse_travel:.3f} m) "
+                        f"and arm tucked (ee_z={ee_z:.3f}, arm_err={arm_err:.3f}); "
+                        f"carry pose lock released")
                     self.state_t0 = self.now()
                 elif self.now() - self.state_t0 > PLACE_OPEN_TIMEOUT:
                     if referee_completed_now:
@@ -6193,6 +6266,7 @@ class PickPlaceClient(Node):
                         # the flow as released rather than failing the item.
                         self.place_sub = 2
                         self.loaded_carry_hold = None
+                        self.place_arm_slow = False
                         self.set_twist(0.0, 0.0)
                         self.get_logger().info(
                             "[place] gripper open unconfirmed but referee scored S5; "
@@ -6212,29 +6286,11 @@ class PickPlaceClient(Node):
                     if not self._s5_placed_counted:
                         self._s5_placed_counted = True
                         self.placed_success_count += 1
-                    # Round 56: turning away right after S5 swept the still-low
-                    # gripper (ee_z ~0.84, bottle mid-height ~0.895) through the
-                    # just-placed bottle and knocked it off the table.  Raise
-                    # the empty hand above the bottle top BEFORE declaring DONE
-                    # so the next-task turn cannot touch the placed bottle.
-                    ee_z = float(self.ee_world()[2])
-                    if ee_z < PLACE_TURN_CLEAR_EE_Z - 0.01:
-                        self.tc[2] = float(np.clip(
-                            float(self.tc[2]) + PLACE_SLIDE_K * (ee_z - PLACE_TURN_CLEAR_EE_Z),
-                            0.08, PLACE_SLIDE_MAX))
-                        self.set_twist(0.0, 0.0)
-                        if self.now() - self.state_t0 > PLACE_TURN_CLEAR_TIMEOUT:
-                            # Raised as far as the placed-arm pose allows; the
-                            # timeout must never stall the flow.  If the pose
-                            # cannot even clear the bottle top, retry the local
-                            # clear so the turn still happens safely (the
-                            # 10 s budget is far beyond any reachable raise).
-                            self.get_logger().warn(
-                                f"[place_verify] turn-clear raise capped at "
-                                f"ee_z={ee_z:.3f} after "
-                                f"{PLACE_TURN_CLEAR_TIMEOUT:.0f}s; declaring DONE")
-                            self.phase = DONE
-                        return
+                    # Round 61: POST_PLACE_EGRESS already tucked the empty arm
+                    # (low slide + INIT_ARM_R) during the reverse, so the
+                    # next-task turn has minimal sweep.  The old turn-clear
+                    # slide raise (round 56) is no longer needed and actually
+                    # moved the arm through the placed bottle in v72.
                     self.phase = DONE
                 else:
                     if (

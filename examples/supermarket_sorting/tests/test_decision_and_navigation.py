@@ -941,9 +941,10 @@ class NavigationTests(unittest.TestCase):
         # Consecutive items must never target the same x spot (the y stagger
         # is zero in the official baseline; v70 proves a fixed spot is safe,
         # so a 3-spot x rotation with distinct neighbours is sufficient).
+        # Round 61: five unique spots at 8 cm spacing.
         for i in range(1, len(seen_xy)):
             self.assertGreaterEqual(
-                abs(seen_xy[i][0] - seen_xy[i - 1][0]), 0.10)
+                abs(seen_xy[i][0] - seen_xy[i - 1][0]), 0.07)
         self.assertEqual(len(client_mod.PLACE_X_OFFSETS), 5)
         self.assertEqual(len(client_mod.PLACE_Y_OFFSETS), 5)
 
@@ -1270,7 +1271,10 @@ class NavigationTests(unittest.TestCase):
         self.assertLess(travel, client_mod.PLACE_REVERSE_DISTANCE)
         self.assertFalse(done)
 
-        client.base_xy = client.place_reverse_start + np.array([0.0, 0.071], dtype=float)
+        # Round 61: the full egress reverse is 0.25 m (was 0.07 m) so the
+        # tucked arm clears the placed bottle before the turn.
+        client.base_xy = client.place_reverse_start + np.array(
+            [0.0, client_mod.PLACE_REVERSE_DISTANCE + 0.001], dtype=float)
         travel, done = client_mod.PickPlaceClient.place_reverse_progress(client)
         self.assertGreaterEqual(travel, client_mod.PLACE_REVERSE_DISTANCE)
         self.assertTrue(done)
