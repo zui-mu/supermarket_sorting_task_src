@@ -196,6 +196,13 @@ GENERIC_DETECTION_CLASSES = {
 }
 DETECTIONS_TOPIC = os.getenv("SUPERMARKET_DETECTIONS_TOPIC", "/supermarket_sorting/detections").strip() or "/supermarket_sorting/detections"
 VISION_SURFACE_TO_CENTER_FWD = 0.0265     # kele radius: RGB-D point is on the visible front surface
+# Round 61f: the RGB-D point is on the product's VISIBLE surface, which in a
+# shelf-front view (head camera slightly above) is BELOW the object's mass
+# centre in z.  GT mode gave the true centre so this was never exposed; YOLO
+# real detection put a zhijin's z at ~0.50 while its L2 centre was ~0.895
+# (0.4 m low -> height/assoc reject -> could not lock).  surface_to_center_z
+# is the object half-height to lift the measured surface z back to centre.
+VISION_SURFACE_TO_CENTER_Z = 0.0
 # Keep only a small lateral bias.  The previous 12 mm shift made the left
 # fingertip align with the bottle centre, so the grasp succeeded mostly by
 # friction after pushing.  A slight inward bias still helps the fingers bite
@@ -605,7 +612,9 @@ PRODUCT_GRASP_PROFILES = {
         # wrist's finger-mount box below the shelf L1 board and the creep
         # collides with the board's front edge (verified run 68).
         "deploy_offset": np.array([0.006, -0.225, 0.006]),
+        "middle_axis": True,
         "surface_to_center_fwd": 0.0265,
+        "surface_to_center_z": 0.0725,
         "center_x_bias": -0.003,
         # Fingers must reach PAST the bottle centre to wrap it.  The v69
         # experiment (0.060) moved the close point 1.8 cm deeper and caused a
@@ -682,6 +691,7 @@ PRODUCT_GRASP_PROFILES = {
         # cylinder r=32.5 mm, h=210 mm: pinch just below its mass centre.
         "deploy_offset": np.array([0.006, -0.225, 0.006]),
         "surface_to_center_fwd": 0.0325,
+        "surface_to_center_z": 0.105,
         "center_x_bias": -0.004,
         "endpoint_from_pinch_fwd": 0.046,
         "contact_z_bias": 0.006,
@@ -727,6 +737,7 @@ PRODUCT_GRASP_PROFILES = {
         # creep can wipe this light package off the shelf instead of seating it.
         "deploy_offset": np.array([0.006, -0.226, 0.020]),
         "surface_to_center_fwd": 0.050,
+        "surface_to_center_z": 0.0495,
         "center_x_bias": 0.0,
         "endpoint_from_pinch_fwd": 0.036,
         "contact_z_bias": -0.022,
@@ -762,6 +773,7 @@ PRODUCT_GRASP_PROFILES = {
         # then use the same slow final approach as the sandwich.
         "deploy_offset": np.array([0.006, -0.235, 0.020]),
         "surface_to_center_fwd": 0.048,
+        "surface_to_center_z": 0.035,
         "center_x_bias": -0.003,
         "endpoint_from_pinch_fwd": 0.041,
         "contact_z_bias": -0.020,
@@ -793,6 +805,7 @@ PRODUCT_GRASP_PROFILES = {
         # edge catch a shelf; retain a centred but low-force final advance.
         "deploy_offset": np.array([0.006, -0.240, 0.018]),
         "surface_to_center_fwd": 0.0325,
+        "surface_to_center_z": 0.08,
         "center_x_bias": -0.002,
         "endpoint_from_pinch_fwd": 0.044,
         "contact_z_bias": -0.018,
@@ -833,6 +846,7 @@ PRODUCT_GRASP_PROFILES = {
         # Do not "correct" it to half-depth without re-calibrating the whole
         # zhijin grasp (creep + endpoint offsets compensate together).
         "surface_to_center_fwd": 0.028,
+        "surface_to_center_z": 0.05,
         "center_x_bias": -0.001,
         "endpoint_from_pinch_fwd": 0.016,
         "contact_z_bias": 0.000,
@@ -888,6 +902,7 @@ PRODUCT_GRASP_PROFILES = {
     "kouxiangtang": {
         "deploy_offset": np.array([0.004, -0.225, 0.030]),
         "surface_to_center_fwd": 0.030,
+        "surface_to_center_z": 0.02,
         "center_x_bias": -0.004,
         "creep_stop_dy": -0.004,
         "lift_amount": 0.026,
@@ -909,6 +924,7 @@ PRODUCT_GRASP_PROFILES = {
         # prevents rolling along the shelf during the last centimetres.
         "deploy_offset": np.array([0.004, -0.235, 0.020]),
         "surface_to_center_fwd": 0.035,
+        "surface_to_center_z": 0.035,
         "center_x_bias": 0.0,
         "endpoint_from_pinch_fwd": 0.042,
         "contact_z_bias": 0.005,
@@ -928,6 +944,7 @@ PRODUCT_GRASP_PROFILES = {
     "chengzi": {
         "deploy_offset": np.array([0.004, -0.235, 0.020]),
         "surface_to_center_fwd": 0.037,
+        "surface_to_center_z": 0.035,
         "center_x_bias": 0.0,
         "endpoint_from_pinch_fwd": 0.042,
         "contact_z_bias": 0.005,
@@ -950,6 +967,7 @@ PRODUCT_GRASP_PROFILES = {
     "tudou": {
         "deploy_offset": np.array([0.004, -0.235, 0.020]),
         "surface_to_center_fwd": 0.035,
+        "surface_to_center_z": 0.035,
         "center_x_bias": 0.0,
         "endpoint_from_pinch_fwd": 0.042,
         "contact_z_bias": 0.005,
@@ -2809,7 +2827,15 @@ class PickPlaceClient(Node):
         """Convert a visible RGB-D surface point into an estimated object center."""
         fp = self.world_to_footprint(p_world)
         fp[0] += float(self.grasp_profile.get("surface_to_center_fwd", VISION_SURFACE_TO_CENTER_FWD))
-        return self.footprint_to_world(fp)
+        world = self.footprint_to_world(fp)
+        # Round 61f: surface z -> centre z.  The RGB-D point sits on the side
+        # facing the head camera (slightly above-looking), so its z reads low
+        # relative to the object's true centre (YOLO: zhijin z=0.50 vs L2
+        # centre 0.895; GT never exposed this).  Lift by the object half-
+        # height so the locked grasp target is the product centre.
+        world[2] += float(self.grasp_profile.get(
+            "surface_to_center_z", VISION_SURFACE_TO_CENTER_Z))
+        return world
 
     def live_target_displaced(self):
         """Use live vision as a safety monitor after the grasp target is locked."""
