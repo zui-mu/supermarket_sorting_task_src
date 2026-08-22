@@ -124,13 +124,17 @@ class DecisionPickPlaceClient(PickPlaceClient):
             return
         try:
             accepted = self.task_manager.register_inventory_observations(observations)
-            # PR5: the client ArUco kind gate must only reflect CONFIRMED
-            # inventory (the base class version of this callback is shadowed
-            # here, so update the map explicitly).
+            # PR5: the client ArUco kind gate + search lock world must only
+            # reflect CONFIRMED inventory (the base class version of this
+            # callback is shadowed here, so update both maps explicitly from
+            # the task manager's confirmed records - never a one-frame pose).
             try:
                 for aruco_id, record in self.task_manager.inventory_by_aruco.items():
                     if record.get("confirmed"):
                         self.inventory_aruco_kind[int(aruco_id)] = str(record.get("kind", ""))
+                        w = record.get("world")
+                        if isinstance(w, (tuple, list)) and len(w) >= 3:
+                            self.inventory_aruco_world[int(aruco_id)] = tuple(float(v) for v in w[:3])
             except Exception:  # noqa: BLE001
                 pass
             if accepted:
@@ -380,6 +384,7 @@ class DecisionPickPlaceClient(PickPlaceClient):
             # the client ArUco kind gate (and the manager inventory) must be
             # reset together; last run's identity table is void.
             self.inventory_aruco_kind.clear()
+            self.inventory_aruco_world.clear()
         except Exception as exc:  # noqa: BLE001 - a malformed task must not kill the node
             self.get_logger().error(
                 '[decision] failed to apply official task: %s' % exc)

@@ -1598,6 +1598,7 @@ class PickPlaceClient(Node):
         # search_slot_world (which can bind the neighbour's product to this
         # slot in a randomized layout).
         self.inventory_aruco_kind: dict[int, str] = {}
+        self.inventory_aruco_world: dict[int, tuple] = {}
         self.create_subscription(String, "/supermarket_sorting/inventory_observations",
                                  self.inventory_observation_cb, 5)
         if self.test_oracle_enabled:
@@ -2437,6 +2438,11 @@ class PickPlaceClient(Node):
             if not 0 <= aid < 45 or not kind or conf < 0.4:
                 continue
             self.inventory_aruco_kind[aid] = kind
+            # NOTE: inventory_aruco_world is intentionally NOT updated here.
+            # A single bound observation is not yet CONFIRMED (INVENTORY_MIN_HITS
+            # >= 2); the decision subclass updates the world map only from the
+            # task manager's confirmed records, so search-mode locking can
+            # never use a one-frame pose.
 
     def scan_cb(self, msg):
         self.scan_ranges = np.asarray(msg.ranges, dtype=float)
@@ -2892,6 +2898,25 @@ class PickPlaceClient(Node):
         # product outside the current approach lane before the arm deploys.
         if not monitor_locked_target and (self.target_locked or self.phase != DEPLOY or self.deploy_set):
             return
+        # PR5: in anonymous search mode the ArUco-bound inventory is the ONLY
+        # legal lock source.  Once the task manager confirmed what kind this
+        # slot (aruco_id) holds and we have its world, feed that pose straight
+        # to the lock buffer instead of associating bare detections against the
+        # static search_slot_world (which does not match the randomized
+        # layout -> endless "vision target timeout").
+        if (
+            self.active_search_mode()
+            and not monitor_locked_target
+            and self.active_task is not None
+            and hasattr(self.active_task, "aruco_id")
+        ):
+            aid = int(self.active_task.aruco_id)
+            confirmed_world = self.inventory_aruco_world.get(aid)
+            confirmed_kind = self.inventory_aruco_kind.get(aid)
+            if confirmed_world is not None and confirmed_kind:
+                if self.search_accepts_detected_product(confirmed_kind):
+                    self.det_buf.append(np.asarray(confirmed_world, dtype=float))
+                    return
         best, best_class, best_score = None, None, float("inf")
         counts = {
             "messages": 1,
