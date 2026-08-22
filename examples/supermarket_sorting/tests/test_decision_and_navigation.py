@@ -25,6 +25,7 @@ for _path in (str(PACKAGE_ROOT), str(REPO_ROOT)):
 try:
     from manipulation.grasp_pose import finger_closing_axis, grasp_rotation_for_strategy
     from manipulation.arm_capabilities import requires_mirrored_left_arm
+    from manipulation.cartesian_path import interpolate_se3, plan_continuous_ik_path
     from decision.models import NavigationTarget, PickTask
     from decision.task_manager import SEARCH_PRODUCT, TaskManager
     from navigation.grid_planner import SupermarketGridPlanner
@@ -40,11 +41,84 @@ except ModuleNotFoundError:
     from examples.supermarket_sorting.manipulation.arm_capabilities import (
         requires_mirrored_left_arm,
     )
+    from examples.supermarket_sorting.manipulation.cartesian_path import (
+        interpolate_se3,
+        plan_continuous_ik_path,
+    )
     from examples.supermarket_sorting.decision.models import NavigationTarget, PickTask
     from examples.supermarket_sorting.decision.task_manager import SEARCH_PRODUCT, TaskManager
     from examples.supermarket_sorting.navigation.grid_planner import SupermarketGridPlanner
     from examples.supermarket_sorting.perception.backends import stable_class_consensus
     from examples.supermarket_sorting.perception.inventory import associate_detections_to_markers
+
+
+class CartesianPathTests(unittest.TestCase):
+    def test_interpolate_se3_bounds_steps_and_reaches_exact_goal(self):
+        start = np.eye(4)
+        goal = np.eye(4)
+        goal[:3, :3] = Rotation.from_euler("z", 0.5).as_matrix()
+        goal[:3, 3] = [0.035, -0.012, 0.0]
+
+        poses = interpolate_se3(
+            start,
+            goal,
+            translation_step=0.01,
+            rotation_step_rad=0.12,
+        )
+
+        previous = start
+        for pose in poses:
+            self.assertLessEqual(
+                float(np.linalg.norm(pose[:3, 3] - previous[:3, 3])),
+                0.01 + 1e-9,
+            )
+            delta = Rotation.from_matrix(previous[:3, :3].T @ pose[:3, :3])
+            self.assertLessEqual(float(delta.magnitude()), 0.12 + 1e-9)
+            previous = pose
+        np.testing.assert_allclose(poses[-1], goal, atol=1e-9)
+
+    def test_interpolate_se3_supports_shared_multi_arm_sample_grid(self):
+        start = np.eye(4)
+        short_goal = np.eye(4)
+        short_goal[0, 3] = 0.019
+        long_goal = np.eye(4)
+        long_goal[0, 3] = 0.029
+
+        short_auto = interpolate_se3(start, short_goal, translation_step=0.01)
+        long_auto = interpolate_se3(start, long_goal, translation_step=0.01)
+        self.assertEqual((len(short_auto), len(long_auto)), (2, 3))
+
+        synchronized = interpolate_se3(
+            start,
+            short_goal,
+            translation_step=0.01,
+            segments=5,
+        )
+        self.assertEqual(len(synchronized), 5)
+        np.testing.assert_allclose(synchronized[-1], short_goal, atol=1e-9)
+
+    def test_continuous_ik_rejects_a_joint_branch_jump(self):
+        poses = [np.eye(4) for _ in range(3)]
+        calls = 0
+
+        def solve(_pose, previous):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                return [previous + 0.8]
+            return [previous + 0.05]
+
+        result = plan_continuous_ik_path(
+            poses,
+            solve,
+            np.zeros(6),
+            max_joint_step=0.3,
+        )
+
+        self.assertFalse(result.complete)
+        self.assertAlmostEqual(result.achieved_fraction, 1.0 / 3.0)
+        self.assertEqual(len(result.joint_path), 1)
+        self.assertIn("waypoint 2/3", result.reason)
 
 
 class TaskManagerTests(unittest.TestCase):
@@ -310,11 +384,11 @@ class TaskManagerTests(unittest.TestCase):
         self.assertEqual(selected.aruco_id, 31)
         self.assertEqual(selected.product_name, "kele")
         self.assertAlmostEqual(selected.world_position[0], 0.875)
-        self.assertAlmostEqual(selected.world_position[1], 3.23)
+        self.assertAlmostEqual(selected.world_position[1], 3.243)
         self.assertAlmostEqual(selected.world_position[2], 0.9235)
         self.assertTrue(selected.metadata["inventory_confirmed"])
         self.assertAlmostEqual(selected.navigation_target.x, 0.875 - 0.108)
-        self.assertAlmostEqual(selected.navigation_target.y, 3.23 - 0.768)
+        self.assertAlmostEqual(selected.navigation_target.y, 3.243 - 0.768)
 
     def test_inventory_observation_clamps_depth_z_to_slot_level_and_product_height(self):
         manager = TaskManager()
@@ -375,6 +449,43 @@ class TaskManagerTests(unittest.TestCase):
         self.assertEqual(record["state"], "confirmed")
         self.assertAlmostEqual(record["last_seen"], 123.46)
         self.assertEqual(record["marker_world"], (0.71, 3.21, 0.89))
+
+    def test_inventory_depth_is_anchored_to_same_frame_fixed_marker(self):
+        manager = TaskManager()
+        # Both estimates share a +5 cm odom/camera timing error.  ArUco 3's
+        # fixed marker plane is y=3.168, so the product surface must be shifted
+        # by the same -5 cm before it enters fresh-grasp history.
+        observations = []
+        for index in range(3):
+            observations.append({
+                "aruco_id": 3,
+                "kind": "zhijin",
+                "confidence": 0.99,
+                "object_world": [-1.955, 3.218, 0.90],
+                "marker_world": [-1.955, 3.218, 0.852],
+                "frame_stamp": 300.0 + index * 0.05,
+                "association_score": 0.2,
+                "reject_reason": "ok",
+                "ambiguous": False,
+            })
+        manager.register_inventory_observations(observations)
+        record = manager.inventory_by_aruco[3]
+
+        self.assertEqual(len(record["pose_history"]), 3)
+        for sample in record["pose_history"]:
+            self.assertAlmostEqual(sample["world"][1], 3.168, places=6)
+
+    def test_fresh_grasp_center_depth_uses_marker_to_center_plane(self):
+        manager = TaskManager()
+        anchored = manager.anchor_grasp_center_depth_to_marker(
+            aruco_id=3,
+            center_world=(-1.91, 3.191, 0.895),
+            marker_world=(-1.946, 3.166, 0.823),
+        )
+
+        self.assertAlmostEqual(anchored[0], -1.91)
+        self.assertAlmostEqual(anchored[1], 3.241)
+        self.assertAlmostEqual(anchored[2], 0.895)
 
     def test_same_stamp_counts_only_once(self):
         """PR5: the same camera frame (identical stamp) must count as ONE hit,
@@ -631,6 +742,102 @@ class TaskManagerTests(unittest.TestCase):
         rec = manager.inventory_by_aruco[aid]
         self.assertEqual(rec["state"], "reserved")
         self.assertGreater(rec["pose_seen_at"], old_pose)
+
+    def test_schema_v3_rejects_ambiguous_or_excessive_association(self):
+        manager = TaskManager()
+        base = {
+            "aruco_id": 31,
+            "kind": "kele",
+            "confidence": 0.99,
+            "object_world": [0.875, 3.23, 0.94],
+            "frame_stamp": 600.0,
+            "reject_reason": "ok",
+        }
+        manager.register_inventory_observations([
+            {**base, "ambiguous": True, "association_score": 0.1},
+            {**base, "ambiguous": False, "association_score": 99.0},
+        ])
+        self.assertNotIn(31, manager.inventory_by_aruco)
+
+    def test_fresh_grasp_pose_requires_three_unique_current_frames(self):
+        manager = TaskManager()
+        manager.build_search_tasks_for_targets([{"id": "item_01", "kind": "kele"}])
+        slot_x = float(manager.slot_by_aruco[31]["world_position"][0])
+        common = {
+            "aruco_id": 31,
+            "kind": "kele",
+            "confidence": 0.99,
+            "association_score": 0.2,
+            "ambiguous": False,
+            "reject_reason": "ok",
+        }
+        manager.register_inventory_observations([
+            {**common, "object_world": [slot_x - 0.015, 3.22, 0.94], "frame_stamp": 610.0},
+            {**common, "object_world": [slot_x - 0.005, 3.23, 0.94], "frame_stamp": 610.1},
+        ])
+        active = manager.next_decision().selected_task
+        self.assertEqual(active.aruco_id, 31)
+        self.assertIsNone(manager.fresh_grasp_observation(active))
+
+        manager.register_inventory_observations([{
+            **common,
+            "object_world": [slot_x + 0.015, 3.24, 0.94],
+            "frame_stamp": 610.2,
+        }])
+        fresh = manager.fresh_grasp_observation(active)
+        self.assertIsNotNone(fresh)
+        self.assertEqual(fresh["sample_count"], 3)
+
+    def test_fresh_grasp_updates_pose_without_moving_navigation_goal(self):
+        manager = TaskManager()
+        manager.build_search_tasks_for_targets([{"id": "item_01", "kind": "kele"}])
+        slot_x = float(manager.slot_by_aruco[31]["world_position"][0])
+        common = {
+            "aruco_id": 31,
+            "kind": "kele",
+            "confidence": 0.99,
+            "association_score": 0.2,
+            "ambiguous": False,
+            "reject_reason": "ok",
+        }
+        manager.register_inventory_observations([
+            {**common, "object_world": [slot_x - 0.015, 3.22, 0.94], "frame_stamp": 620.0},
+            {**common, "object_world": [slot_x - 0.005, 3.23, 0.94], "frame_stamp": 620.1},
+        ])
+        active = manager.next_decision().selected_task
+        frozen_nav_target = active.navigation_target.to_dict()
+        frozen_nav_world = active.navigation_world_position
+
+        manager.register_inventory_observations([{
+            **common,
+            "object_world": [slot_x + 0.015, 3.24, 0.94],
+            "frame_stamp": 620.2,
+        }])
+        self.assertTrue(manager.apply_fresh_grasp_observation(active))
+        self.assertEqual(active.navigation_target.to_dict(), frozen_nav_target)
+        self.assertEqual(active.navigation_world_position, frozen_nav_world)
+        self.assertEqual(active.world_position, active.fresh_grasp_world)
+        self.assertEqual(active.metadata["fresh_grasp_frame_stamps"], [620.0, 620.1, 620.2])
+
+    def test_fresh_grasp_rejects_stale_history(self):
+        manager = TaskManager()
+        task = self._manual_search_task("search_stale_fresh", 31, nav_x=0.9, nav_y=2.45)
+        task.product_name = "kele"
+        manager.inventory_by_aruco[31] = {
+            "kind": "kele",
+            "confirmed": True,
+            "state": "reserved",
+            "pose_history": [
+                {
+                    "world": (0.875, 3.23, 0.9235),
+                    "stamp": 630.0 + index * 0.1,
+                    "fresh_at": time.time() - 1.0,
+                    "association_score": 0.2,
+                }
+                for index in range(3)
+            ],
+        }
+        self.assertIsNone(manager.fresh_grasp_observation(task))
 
     def test_pr5_new_run_clears_manager_inventory(self):
         """PR5: a new /task payload (new run) clears the inventory table."""
@@ -921,6 +1128,28 @@ class NavigationTests(unittest.TestCase):
             self.assertTrue(planner.path_is_clear(previous, point))
             previous = point
 
+    def test_shelf_recovery_crosses_divider_in_high_band(self):
+        # Official probe 15 recovered from the east side at (2.03, 1.88).
+        # A 0.30 m divider inflation pruned this into a y=2.02 diagonal and
+        # the chassis spun on the divider. The unloaded recovery planner now
+        # retains enough clearance for steering error as it crosses x=0.53.
+        planner = SupermarketGridPlanner(corridor_clearance=0.65)
+        start = np.array([2.03, 1.88])
+        route = planner.plan(start, (-1.93, 2.34))
+        self.assertTrue(route)
+
+        previous = start
+        crossing_y = None
+        for raw_point in route:
+            point = np.asarray(raw_point, dtype=float)
+            if (previous[0] - 0.53) * (point[0] - 0.53) <= 0.0:
+                fraction = (0.53 - previous[0]) / (point[0] - previous[0])
+                crossing_y = previous[1] + fraction * (point[1] - previous[1])
+                break
+            previous = point
+        self.assertIsNotNone(crossing_y)
+        self.assertGreaterEqual(crossing_y, 2.38)
+
     def test_loaded_delivery_crosses_divider_above_arm_clearance_line(self):
         planner = SupermarketGridPlanner(corridor_clearance=0.88)
         # The old y=2.06 and y=2.38 lateral crossings clear a bare base at
@@ -954,7 +1183,7 @@ class NavigationTests(unittest.TestCase):
         self.assertTrue(bare.path_is_clear(start, goal, dynamic))
         self.assertFalse(loaded.path_is_clear(start, goal, dynamic))
 
-    def test_shelf_recovery_uses_fixed_corridor_after_stuck_event(self):
+    def test_shelf_recovery_uses_dynamic_astar_after_stuck_event(self):
         fake_modules = {
             "rclpy": types.SimpleNamespace(init=lambda: None, spin=lambda node: None, ok=lambda: False, shutdown=lambda: None),
             "rclpy.node": types.SimpleNamespace(Node=object),
@@ -991,9 +1220,40 @@ class NavigationTests(unittest.TestCase):
             float(client_mod.PRODUCT_GRASP_PROFILES["zhijin"]["deploy_offset"][2]),
             0.0,
         )
-        self.assertEqual(
+        self.assertAlmostEqual(
             float(client_mod.PRODUCT_GRASP_PROFILES["zhijin"]["contact_z_bias"]),
-            0.0,
+            0.018,
+        )
+        self.assertEqual(
+            float(client_mod.PRODUCT_GRASP_PROFILES["zhijin"]["wrist_pitch_deg"]),
+            58.0,
+        )
+        self.assertLessEqual(
+            float(client_mod.PRODUCT_GRASP_PROFILES["zhijin"]["deploy_link4_max_z"]),
+            1.125,
+        )
+        self.assertAlmostEqual(
+            float(client_mod.PRODUCT_GRASP_PROFILES["zhijin"]["deploy_forward_offsets"][0]),
+            0.09,
+        )
+        self.assertIn(
+            0.04,
+            tuple(client_mod.PRODUCT_GRASP_PROFILES["zhijin"]["deploy_forward_offsets"]),
+        )
+        self.assertLessEqual(
+            float(client_mod.PRODUCT_GRASP_PROFILES["zhijin"]["deploy_arm_slew"]),
+            0.35,
+        )
+        self.assertLessEqual(client_mod.DEPLOY_LATERAL_TOL, 0.045)
+        self.assertLessEqual(client_mod.DEPLOY_COLLISION_YAW_SHIFT, 0.075)
+        self.assertGreater(client_mod.DEPLOY_COLLISION_YAW_SHIFT, 0.06)
+        self.assertLessEqual(
+            float(client_mod.PRODUCT_GRASP_PROFILES["zhijin"]["geometry_close_remaining"]),
+            0.045,
+        )
+        self.assertLessEqual(
+            float(client_mod.PRODUCT_GRASP_PROFILES["zhijin"]["creep_timeout_arm_extension"]),
+            0.045,
         )
 
         # L3 tissue boxes need a column-dependent chassis standoff.  A centre
@@ -1019,6 +1279,15 @@ class NavigationTests(unittest.TestCase):
         client.nav_mode = "drive"
         client.last_replan_time = 0.0
         client.now = lambda: 100.0
+        dynamic_points = [(0.40, 2.20)]
+        expected = [[0.25, 2.35], [0.82, 2.45]]
+        client.enable_obstacle_avoidance = True
+        client.navigation_obstacle_points = lambda max_range=5.0: dynamic_points
+        client.planner = types.SimpleNamespace(
+            plan=lambda start, finish, dynamic: expected
+            if dynamic == dynamic_points
+            else []
+        )
         client.get_logger = lambda: types.SimpleNamespace(
             info=lambda *args, **kwargs: None
         )
@@ -1029,13 +1298,12 @@ class NavigationTests(unittest.TestCase):
 
         goal = np.array([0.82, 2.45], dtype=float)
         route = client_mod.PickPlaceClient.plan_route(client, goal, "shelf")
-        expected = client.shelf_corridor_route(goal)
 
         self.assertEqual(route, expected)
         self.assertNotEqual(route, client.route_to_shelf)
         self.assertTrue(route)
         self.assertEqual(route[-1], goal.tolist())
-        self.assertIn([float(goal[0]), client_mod.SHELF_CROSS_Y], route)
+        self.assertEqual(client.navigation_obstacle_points(), dynamic_points)
 
         client.base_xy = np.array([0.82, 2.06], dtype=float)
         delivery = client_mod.PickPlaceClient.delivery_corridor_route(client)
@@ -1224,6 +1492,69 @@ class NavigationTests(unittest.TestCase):
             client, route, client_mod.GRASP_YAW))
         self.assertTrue(commands)
         self.assertEqual(commands[-1][0], 0.0)
+        self.assertLessEqual(abs(commands[-1][1]), client_mod.SHELF_CROSS_ANGULAR_CAP)
+
+    def test_shelf_lateral_crossing_does_not_drive_with_moderate_yaw_error(self):
+        """Regression for the y=2.24 divider collision in official-image probe 10."""
+        fake_modules = {
+            "rclpy": types.SimpleNamespace(init=lambda: None, spin=lambda node: None, ok=lambda: False, shutdown=lambda: None),
+            "rclpy.node": types.SimpleNamespace(Node=object),
+            "geometry_msgs.msg": types.SimpleNamespace(Twist=object),
+            "std_msgs.msg": types.SimpleNamespace(Float64MultiArray=object, String=object),
+            "nav_msgs.msg": types.SimpleNamespace(Odometry=object),
+            "sensor_msgs.msg": types.SimpleNamespace(Image=object, JointState=object, LaserScan=object, CameraInfo=object),
+            "std_srvs.srv": types.SimpleNamespace(Trigger=object),
+            "vision_msgs.msg": types.SimpleNamespace(Detection3DArray=object),
+            "discoverse.utils": types.SimpleNamespace(step_func=lambda *args, **kwargs: None),
+            "mmk2_kdl": types.SimpleNamespace(MMK2Kdl=object),
+            "perception.backends": types.SimpleNamespace(stable_class_consensus=lambda *args, **kwargs: None),
+            "navigation.grid_planner": types.SimpleNamespace(SupermarketGridPlanner=SupermarketGridPlanner),
+        }
+        with mock.patch.dict(sys.modules, fake_modules):
+            import importlib
+
+            client_mod = importlib.import_module("supermarket_sorting_client")
+
+        client = object.__new__(client_mod.PickPlaceClient)
+        commands = []
+        route = [
+            [1.92, client_mod.SHELF_CROSS_Y],
+            [-1.93, client_mod.SHELF_CROSS_Y],
+            [-1.93, 2.48],
+        ]
+        client.phase = client_mod.NAV_SHELF
+        client.recovery_state = "idle"
+        client.route_needs_plan = False
+        client.route_goal = None
+        client.route_purpose = "shelf"
+        client.front_blocked = False
+        client.front_blocked_since = None
+        client.carry_departure_settle_until = 0.0
+        client.last_replan_time = 0.0
+        client.nav_idx = 1
+        client.nav_mode = "turn"
+        client.base_xy = np.array([1.92, client_mod.SHELF_CROSS_Y], dtype=float)
+        # Target bearing is approximately pi; this reproduces the 0.38-rad
+        # residual error where the old controller began its unsafe arc.
+        client.base_yaw = float(np.pi - 0.38)
+        client.turn_tol = 0.05
+        client.grasp_profile = {}
+        client.route_to_shelf = [list(point) for point in route]
+        client.last_nav_progress_xy = np.array(client.base_xy, dtype=float)
+        client.last_nav_progress_time = 10.0
+        client.shelf_turn_progress_yaw = None
+        client.delivery_turn_progress_yaw = None
+        client.nav_recovery_count = 0
+        client.now = lambda: 10.1
+        client.set_twist = lambda linear, angular: commands.append((linear, angular))
+        client.maybe_start_stuck_recovery = lambda target: False
+        client.maybe_start_delivery_turn_recovery = lambda: False
+
+        self.assertFalse(client_mod.PickPlaceClient.follow_route(
+            client, route, client_mod.GRASP_YAW))
+        self.assertTrue(commands)
+        self.assertEqual(commands[-1][0], 0.0)
+        self.assertGreater(commands[-1][1], 0.0)
         self.assertLessEqual(abs(commands[-1][1]), client_mod.SHELF_CROSS_ANGULAR_CAP)
 
     def test_place_raise_search_uses_lower_reachable_ik_target(self):
@@ -1505,6 +1836,36 @@ class NavigationTests(unittest.TestCase):
         # the backtrack target.
         self.assertAlmostEqual(client.crumb_target[0], 0.0)
         self.assertAlmostEqual(client.crumb_target[1], 1.3)
+
+        # Collision jitter must not defeat the absolute waypoint deadline.
+        # This reproduces the official-seed stall where the chassis advanced
+        # only centimetres while continuously pushing a randomized box.
+        jitter = object.__new__(client_mod.PickPlaceClient)
+        jitter.nav_mode = "drive"
+        jitter.phase = client_mod.NAV_SHELF
+        jitter.base_xy = np.array([-0.50, 2.10], dtype=float)
+        jitter.nav_idx = 2
+        jitter.route_to_shelf = [[-1.93, 2.24]]
+        jitter.now = lambda: 200.0
+        jitter.front_blocked = False
+        jitter.get_logger = client.get_logger
+        jitter.last_nav_progress_xy = np.array([-0.53, 2.10], dtype=float)
+        jitter.last_nav_progress_time = 190.0
+        jitter.last_nav_dist_to_target = 1.50
+        jitter._nav_waypoint_deadline = 199.0
+        jitter.nav_recovery_count = 0
+        jitter.recovery_escape = False
+        jitter.crumb_trail = []
+        jitter.scan_ranges = None
+        jitter.scan_stamp = 0.0
+        jitter.scan_angle_min = 0.0
+        jitter.scan_angle_increment = 0.0
+
+        triggered = client_mod.PickPlaceClient.maybe_start_stuck_recovery(
+            jitter, np.array([-1.93, 2.24], dtype=float)
+        )
+        self.assertTrue(triggered)
+        self.assertEqual(jitter.recovery_state, "reverse")
 
     def test_startup_clearance_stows_before_straight_exit_without_yaw(self):
         """The right-wall spawn may not enter route-turn control with a moving arm."""

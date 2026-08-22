@@ -25,6 +25,24 @@ class NavigationTarget:
 
 
 @dataclass(slots=True)
+class ScanViewpoint:
+    viewpoint_id: str
+    scope: str
+    shelf: str
+    navigation_target: NavigationTarget
+    head_pitches: tuple[float, ...]
+    covered_aruco_ids: tuple[int, ...] = ()
+    column: str | None = None
+    priority: float = 0.0
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["navigation_target"] = self.navigation_target.to_dict()
+        return payload
+
+
+@dataclass(slots=True)
 class PickTask:
     task_id: str
     product_name: str
@@ -40,6 +58,12 @@ class PickTask:
     retry_count: int = 0
     max_retries: int = 2
     metadata: dict[str, Any] = field(default_factory=dict)
+    # The route target is frozen once navigation starts.  A separate fresh
+    # grasp pose is allowed to move after the chassis has parked and the same
+    # frame has re-confirmed both the active ArUco id and product class.
+    navigation_world_position: tuple[float, float, float] | None = None
+    fresh_grasp_world: tuple[float, float, float] | None = None
+    fresh_grasp_seen_at: float | None = None
     status: TaskStatus = TaskStatus.PENDING
 
     def to_dict(self) -> dict[str, Any]:

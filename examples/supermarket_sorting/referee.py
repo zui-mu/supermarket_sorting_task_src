@@ -158,6 +158,30 @@ class Referee:
             return False
         return any((self.bid[l], oid) in pairs for l in links if l in self.bid)
 
+    def _touch_detail(self, obj, links):
+        """Development diagnostic: identify the first robot/object geom pair."""
+        oid = self.bid.get(obj)
+        if oid is None:
+            return None
+        allowed = {self.bid[name]: name for name in links if name in self.bid}
+        geom_body_ids = self.mj_model.geom_bodyid
+        for first_geom, second_geom in getattr(self, "_contact_geom_pairs", []):
+            first_body = int(geom_body_ids[first_geom])
+            second_body = int(geom_body_ids[second_geom])
+            if first_body in allowed and second_body == oid:
+                return (
+                    allowed[first_body],
+                    self.mj_model.geom(first_geom).name,
+                    self.mj_model.geom(second_geom).name,
+                )
+            if second_body in allowed and first_body == oid:
+                return (
+                    allowed[second_body],
+                    self.mj_model.geom(second_geom).name,
+                    self.mj_model.geom(first_geom).name,
+                )
+        return None
+
     def _gripped(self, pairs, obj):
         """两指同时接触 = 夹持。"""
         return all(self._touch(pairs, [f], obj) for f in self.cfg["grasp_fingers"])
@@ -265,11 +289,12 @@ class Referee:
                     hit_pos = self._pos(mj_data, hit)
                     hit_gripped = hit in gripped_now
                     flow_tgt = f.target if f.target is not None else "none"
+                    contact = self._touch_detail(hit, self.cfg["touch_links"])
                     print(
                         "[referee] C2 detail hit=%s tilt=%.1f shift=%.3f pos=[%.3f %.3f %.3f] "
-                        "gripped=%s flow_target=%s step=S%d" % (
+                        "gripped=%s flow_target=%s step=S%d contact=%s" % (
                             hit, hit_tilt, hit_shift, hit_pos[0], hit_pos[1], hit_pos[2],
-                            hit_gripped, flow_tgt, f.step), flush=True)
+                            hit_gripped, flow_tgt, f.step, contact), flush=True)
                 except Exception:
                     pass
                 self._log(t, "C2 碰倒其他商品 %s (−%d)" % (hit, self.cfg["penalties"]["topple"]))
@@ -282,11 +307,68 @@ class Referee:
             for tgt in remaining:
                 if self._touch(pairs, self.cfg["touch_links"], tgt):
                     f.touched.add(tgt)
+            if f.step in (1, 2) and t - getattr(self, "_s1_finger_diag_last", 0.0) >= 0.5:
+                self._s1_finger_diag_last = t
+                try:
+                    probe = remaining[0] if remaining else None
+                    if probe is not None:
+                        obj = self._pos(mj_data, probe)
+                        left = np.asarray(mj_data.body("rgt_finger_left_link").xpos)
+                        right = np.asarray(mj_data.body("rgt_finger_right_link").xpos)
+                        link6 = np.asarray(mj_data.body("rgt_arm_link6").xpos)
+                        base = np.asarray(mj_data.site("base_link").xpos)
+                        joints = np.array([
+                            mj_data.qpos[
+                                self.mj_model.joint(f"rgt_arm_joint{i}").qposadr[0]
+                            ]
+                            for i in range(1, 7)
+                        ])
+                        if np.linalg.norm(link6 - obj) < 0.45:
+                            print(
+                                "[referee] S1finger obj=[%.3f %.3f %.3f] "
+                                "left=[%.3f %.3f %.3f] right=[%.3f %.3f %.3f] "
+                                "link6=[%.3f %.3f %.3f] base=[%.3f %.3f %.3f]" % (
+                                    *obj, *left, *right, *link6, *base
+                                ),
+                                flush=True,
+                            )
+                            print(
+                                "[referee] S1q rgt=[%.4f %.4f %.4f %.4f %.4f %.4f]"
+                                % tuple(joints),
+                                flush=True,
+                            )
+                            print(
+                                "[referee] S1grip left=%s right=%s"
+                                % (
+                                    self._touch(
+                                        pairs, ["rgt_finger_left_link"], probe
+                                    ),
+                                    self._touch(
+                                        pairs, ["rgt_finger_right_link"], probe
+                                    ),
+                                ),
+                                flush=True,
+                            )
+                except Exception:
+                    pass
             if f.step == 1 and f.touched:
                 f.step = 2
                 f.t["s2"] = t
                 f.t_last_advance = t
                 self._log(t, "S2 够到目标")
+                for touched in sorted(f.touched):
+                    detail = self._touch_detail(
+                        touched, self.cfg["touch_links"]
+                    )
+                    if detail is not None:
+                        print(
+                            "[referee] S2 contact target=%s link=%s "
+                            "robot_geom=%s object_geom=%s" % (
+                                touched, detail[0], detail[1], detail[2]
+                            ),
+                            flush=True,
+                        )
+                        break
 
         # --- 掉落判定(S3 且未夹持时) ---
         # 除了传统的 z < drop_z(掉到地面), 还覆盖"目标落在货架/桌面等高处后静止、

@@ -384,12 +384,14 @@ class KeleDetectNode(Node):
                 # Diagnostic-only observation (not written to formal inventory):
                 # report why this detection was NOT bound to a slot.
                 observations.append({
+                    "frame_stamp": float(stamp_sec),
                     "aruco_id": None,
                     "kind": record["class"],
                     "confidence": float(record["conf"]),
                     "reject_reason": match.get("reject_reason", "unbound"),
                     "ambiguous": bool(match.get("ambiguous", False)),
                     "world": [float(value) for value in record["world"]],
+                    "object_world": [float(value) for value in record["world"]],
                     "stamp": float(stamp_sec),
                 })
                 continue
@@ -419,7 +421,15 @@ class KeleDetectNode(Node):
                     marker_cam[0], marker_cam[1], marker_cam[2], 1.0,
                 ]))[:3]
             slot = aruco_id_to_slot(match["aruco_id"]) or {}
+            det = filtered[match["detection_index"]]
+            bbox = [
+                float(det["x"]) - float(det["w"]) / 2.0,
+                float(det["y"]) - float(det["h"]) / 2.0,
+                float(det["x"]) + float(det["w"]) / 2.0,
+                float(det["y"]) + float(det["h"]) / 2.0,
+            ]
             observations.append({
+                "frame_stamp": float(stamp_sec),
                 "aruco_id": match["aruco_id"],
                 "slot_id": slot.get("slot_id"),
                 "shelf": slot.get("shelf"),
@@ -430,7 +440,9 @@ class KeleDetectNode(Node):
                 "association_score": float(match["score"]),
                 "reject_reason": match.get("reject_reason", "ok"),
                 "ambiguous": bool(match.get("ambiguous", False)),
+                "bbox": bbox,
                 "world": [float(value) for value in record["world"]],
+                "object_world": [float(value) for value in record["world"]],
                 "marker_world": (
                     None if marker_world is None
                     else [float(value) for value in marker_world]
@@ -440,7 +452,7 @@ class KeleDetectNode(Node):
         if observations:
             payload = String()
             payload.data = json.dumps({
-                "schema_version": 2,
+                "schema_version": 3,
                 "observations": observations,
             })
             self.inventory_pub.publish(payload)

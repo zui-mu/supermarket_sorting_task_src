@@ -51,6 +51,7 @@ from manipulation.grasp_pose import (
     grasp_rotation_for_strategy,
 )
 from manipulation.arm_capabilities import requires_mirrored_left_arm
+from manipulation.cartesian_path import interpolate_se3, plan_continuous_ik_path
 from navigation.grid_planner import SupermarketGridPlanner
 from perception.backends import stable_class_consensus
 
@@ -67,7 +68,12 @@ GRASP_YAW = math.pi / 2.0 - math.radians(GRASP_YAW_EAST_BIAS_DEG)  # slightly ea
 # shelf face, then advance to the final observation/grasp standoff only after
 # the target column is reached. Crossing at the old 2.48 line let the stowed
 # right gripper sweep E-shelf products during the initial westbound traverse.
-SHELF_CROSS_Y = float(os.getenv("SUPERMARKET_SHELF_CROSS_Y", "2.24"))
+# Keep the lateral shelf crossing comfortably north of the divider's inflated
+# top edge (y=2.15 in the local planner).  At 2.24 m a 0.3-rad steering arc
+# observed in the official image could pull the chassis down to y=2.06 and pin
+# it on the divider.  The shelf standoff is farther north, so 2.34 m remains a
+# valid approach lane while adding ten centimetres of physical margin.
+SHELF_CROSS_Y = float(os.getenv("SUPERMARKET_SHELF_CROSS_Y", "2.34"))
 SHELF_LOCAL_RETRY_MIN_Y = float(os.getenv(
     "SUPERMARKET_SHELF_LOCAL_RETRY_MIN_Y", "2.00"
 ))
@@ -174,7 +180,7 @@ REQUIRE_LIVE_VISION_AFTER_CONTACT = os.getenv(
 ) == "1"
 STATIC_LAYOUT_ASSOCIATION = os.getenv("SUPERMARKET_STATIC_LAYOUT_ASSOCIATION", "0") == "1"
 STATIC_GEOMETRY_FALLBACK = os.getenv("SUPERMARKET_STATIC_GEOMETRY_FALLBACK", "1") == "1"
-INVENTORY_GEOMETRY_FALLBACK = os.getenv("SUPERMARKET_INVENTORY_GEOMETRY_FALLBACK", "1") == "1"
+INVENTORY_GEOMETRY_FALLBACK = os.getenv("SUPERMARKET_INVENTORY_GEOMETRY_FALLBACK", "0") == "1"
 TARGET_ASSOC_MAX_DIST = float(os.getenv("SUPERMARKET_TARGET_ASSOC_MAX_DIST", "0.28"))
 NEIGHBOR_CLEARANCE_X = float(os.getenv("SUPERMARKET_NEIGHBOR_CLEARANCE_X", "0.13"))
 NEIGHBOR_CLEARANCE_Z = float(os.getenv("SUPERMARKET_NEIGHBOR_CLEARANCE_Z", "0.18"))
@@ -211,7 +217,20 @@ GRASP_CENTER_X_BIAS = float(os.getenv("SUPERMARKET_GRASP_CENTER_X_BIAS", "-0.004
 DEPLOY_CART_TOL = 0.100                  # m; allow small joint-controller residuals before creeping
 DEPLOY_JOINT_TOL = 0.140                  # rad; deploy is followed by straight base creep, not fine arm motion
 DEPLOY_ROT_TOL = 0.50                     # rad; wrist must be close to the upright grasp attitude
+DEPLOY_LATERAL_TOL = float(os.getenv("SUPERMARKET_DEPLOY_LATERAL_TOL", "0.045"))
 DEPLOY_TIMEOUT = float(os.getenv("SUPERMARKET_DEPLOY_TIMEOUT", "12.0"))
+CARTESIAN_DEPLOY_TRANSLATION_STEP = float(os.getenv(
+    "SUPERMARKET_CARTESIAN_DEPLOY_TRANSLATION_STEP", "0.010"
+))
+CARTESIAN_DEPLOY_ROTATION_STEP = float(os.getenv(
+    "SUPERMARKET_CARTESIAN_DEPLOY_ROTATION_STEP", "0.12"
+))
+CARTESIAN_DEPLOY_MAX_JOINT_STEP = float(os.getenv(
+    "SUPERMARKET_CARTESIAN_DEPLOY_MAX_JOINT_STEP", "0.30"
+))
+CARTESIAN_DEPLOY_WAYPOINT_TOL = float(os.getenv(
+    "SUPERMARKET_CARTESIAN_DEPLOY_WAYPOINT_TOL", "0.075"
+))
 CREEP_SPEED = 0.120
 CREEP_FINE_SPEED = 0.060
 CREEP_SLOW_DISTANCE = 0.12
@@ -400,7 +419,7 @@ STUCK_MIN_PROGRESS = float(os.getenv("SUPERMARKET_STUCK_MIN_PROGRESS", "0.008"))
 # pin the base for minutes (v62 item2: 415 s near (0.38,2.78) with odom always
 # moving a little, so the 2.5 cm/4.5 s progress bar never tripped).  Healthy
 # shelf legs take 10-40 s; 90 s is a generous cap a clean run never touches.
-STUCK_WAYPOINT_TIMEOUT = float(os.getenv("SUPERMARKET_STUCK_WAYPOINT_TIMEOUT", "90.0"))
+STUCK_WAYPOINT_TIMEOUT = float(os.getenv("SUPERMARKET_STUCK_WAYPOINT_TIMEOUT", "50.0"))
 STUCK_RECOVERY_TIME = float(os.getenv("SUPERMARKET_STUCK_RECOVERY_TIME", "1.8"))
 # After a few failed reverse-and-replan cycles the robot is usually pinned
 # against an obstacle (visual round 58: a diagonally placed box surrounded
@@ -509,7 +528,10 @@ SHELF_APPROACH_LINEAR_CAP = float(os.getenv("SUPERMARKET_SHELF_APPROACH_LINEAR_C
 SHELF_APPROACH_ANGULAR_CAP = float(os.getenv("SUPERMARKET_SHELF_APPROACH_ANGULAR_CAP", "0.55"))
 SHELF_CROSS_LINEAR_CAP = float(os.getenv("SUPERMARKET_SHELF_CROSS_LINEAR_CAP", "0.20"))
 SHELF_CROSS_ANGULAR_CAP = float(os.getenv("SUPERMARKET_SHELF_CROSS_ANGULAR_CAP", "0.30"))
-SHELF_CROSS_DRIVE_TURN_LIMIT = float(os.getenv("SUPERMARKET_SHELF_CROSS_DRIVE_TURN_LIMIT", "0.55"))
+# A long lateral crossing must start almost square to the lane.  The previous
+# 0.55-rad threshold allowed forward motion at 0.38 rad and produced a large
+# downward arc into the centre divider before pure pursuit could settle.
+SHELF_CROSS_DRIVE_TURN_LIMIT = float(os.getenv("SUPERMARKET_SHELF_CROSS_DRIVE_TURN_LIMIT", "0.18"))
 SHELF_CROSS_LATERAL_MIN = float(os.getenv("SUPERMARKET_SHELF_CROSS_LATERAL_MIN", "0.20"))
 # Final in-place yaw alignment (after the last waypoint) has no position-based
 # stuck detector either. A pinned base must not spin there forever.
@@ -831,14 +853,77 @@ PRODUCT_GRASP_PROFILES = {
         "carry_angular_speed": 0.080,
     },
     "zhijin": {
-        # 172 x 85 x 88 mm box on L2. Keep the physical closing axis on the
-        # 85 mm shelf-depth dimension; it cannot span the 172 mm long face.
+        # The 172 x 85 x 88 mm box is wider than one MMK2 gripper's 80 mm
+        # maximum inner opening.  Use the dual-arm box-hug sequence from the
+        # upstream DISCOVERSE `examples/tasks_mmk2/box_pick.py`: approach both
+        # long ends, squeeze symmetrically, lift, then pull out of the shelf.
+        "dual_arm_hug": False,
+        "tissue_side_pinch": False,
+        "tissue_side_slide": 0.150,
+        # MuJoCo-backprojected calibration (not the KDL endpoint alone): the
+        # physical finger midpoint is about 19 mm shallower and 2 mm farther
+        # sideways than the requested endpoint in this wrist orientation.
+        # Centre the fingers in shelf depth, then cross the tissue's long edge
+        # by only 20 mm before closing so the open gripper cannot pre-push it.
+        "tissue_side_tip_standoff": 0.075,
+        "tissue_side_outer_clearance": 0.155,
+        "tissue_side_depth_bias": 0.001,
+        "tissue_side_waypoint_tolerance": 0.120,
+        "tissue_side_edge_waypoint_tolerance": 0.012,
+        "tissue_side_waypoint_dwell": 0.30,
+        "tissue_side_front_retract": 0.200,
+        "tissue_side_endpoint_z_bias": -0.010,
+        "tissue_side_extract": 0.230,
+        "tissue_side_extract_lift": 0.0,
+        "tissue_top_pinch": True,
+        "tissue_top_slide": 0.500,
+        "tissue_top_gateway_retract": 0.300,
+        "tissue_top_pre_z": 0.200,
+        # Raw official-model contact sweep: at a 60-mm endpoint offset both
+        # real finger meshes close on the 85-mm short side with <4 mm object
+        # pre-motion and remain dual-contacted beyond the referee's 200-mm S3
+        # displacement threshold.  Keep L2 support during that first pull;
+        # lifting first releases the low-force tendon grasp.
+        "tissue_top_grasp_z": 0.060,
+        "tissue_top_depth_bias": -0.004,
+        "tissue_top_lateral_bias": 0.0,
+        "tissue_top_lift": 0.0,
+        "tissue_top_pull": 0.350,
+        "tissue_top_waypoint_tolerance": 0.025,
+        "tissue_top_waypoint_dwell": 0.18,
+        "grip_close_target": 0.0,
+        # Keep the object >=0.60 m forward in footprint coordinates.  The
+        # side-pinch branch is continuous across 0.60--0.68 m, while a closer
+        # stop can select the folded wrist branch used for bottle grasps.
+        "shelf_nav_y": 2.700,
+        # configure_pick_task normally parks a single right-arm grasp 108 mm
+        # west of the object. Cancel that offset so the two shoulders straddle
+        # the box centreline symmetrically.
+        "base_x_bias": RIGHT_ARM_OBJECT_X_OFFSET,
+        # Collision-mesh/KDL search result: these mirrored rotations direct
+        # the distal pad proxy 47 mm inward and 74 mm down while each arm stays
+        # on its own side. The complete pre/insert/squeeze/lift-pull chain has
+        # dual IK at a 0.60-m spine extension.
+        "dual_hug_crossed": False,
+        "dual_hug_right_euler": (-1.1781, 2.3562, -1.5708),
+        "dual_hug_left_euler": (1.1781, 2.3562, 1.5708),
+        "dual_hug_pre_lateral": 0.165,
+        "dual_hug_pre_retract": 0.180,
+        # Wrist targets compensate the searched pad offset, placing the pad
+        # centres about 5 mm above and 5 mm inside the box side faces.
+        "dual_hug_lateral": 0.130,
+        "dual_hug_z_offset": 0.119,
+        "dual_hug_gateway": True,
+        "dual_hug_gateway_z_offset": 0.130,
+        "dual_hug_slide": 0.600,
+        "dual_hug_pull_distance": 0.300,
+        "dual_hug_lift": 0.080,
         "deploy_offset": np.array([0.006, -0.215, 0.000]),
         # The L2 tissue slot has only a narrow gap below L3.  Its earlier
         # shared 110 mm lift made link2 sweep the upper shelf board while the
         # fingers were still outside the box.  Solve the same fingertip pose
         # from a lower spine position so the elbow stays below that board.
-        "grasp_slide": 0.040,
+        "grasp_slide": 0.253,
         # NOTE: 0.028 is a calibrated depth-centre value, deliberately shorter
         # than the box's 42.5 mm half-depth: the tissue box is grabbed across
         # its 85 mm shelf-depth dimension from above, and the visible RGB-D
@@ -849,13 +934,20 @@ PRODUCT_GRASP_PROFILES = {
         "surface_to_center_z": 0.05,
         "center_x_bias": -0.001,
         "endpoint_from_pinch_fwd": 0.016,
-        "contact_z_bias": 0.000,
+        # Continuous-IK/geometry search after probes 17--19 found a feasible
+        # clearance window that the near-vertical pose did not have.  At this
+        # higher, shallower pose the link6 palm remains above the box top while
+        # the link4 collision cylinder remains below the L3 board.  The larger
+        # slide restores the forward reach lost by reducing wrist pitch.
+        "contact_z_bias": 0.018,
         "creep_stop_dy": -0.010,
         "lift_amount": 0.022,
         "neighbor_clearance_x": 0.18,
         "creep_speed": 0.034,
         "creep_fine_speed": 0.012,
         "creep_max_yaw_correction": 0.030,
+        "creep_precontact_guard_lateral": 0.050,
+        "creep_near_lateral_abort": 0.050,
         # This vertical-finger clamp has no reliable fingertip touch event.
         # Once the measured pinch centre is inside this bounded window, close
         # from geometry.
@@ -865,20 +957,33 @@ PRODUCT_GRASP_PROFILES = {
         # stalled about 6-7 cm before this endpoint and then kept retrying.
         # Empty-close retries for tissue are depth errors, not X errors: the
         # 92-110 mm windows closed in air while lateral error was only 1-2 cm.
-        # Keep the first close just inside the observed 67 mm crawl point, then
-        # push later retries deeper without sweeping across neighbour slots.
+        # Probe 12 still closed empty at 66 mm. Move the first closure 21 mm
+        # deeper; later retries keep their bounded depth-only offsets.
         "creep_dy_offsets": (0.0, 0.024, 0.042, 0.058),
         "empty_grasp_x_retry_scale": 0.0,
-        "geometry_close_remaining": 0.066,
+        "geometry_close_remaining": 0.045,
         "geometry_close_lateral_err": 0.030,
-        "forced_geometry_close_remaining": 0.056,
+        "forced_geometry_close_remaining": 0.040,
         "forced_geometry_close_lateral_err": 0.030,
         "require_touch_before_close": False,
+        # Development-oracle calibration: with the 58-degree clearance pose
+        # the first physical contact is a finger pad at remaining ~=80 mm.
+        # Closing there tests the real pinch geometry without allowing the
+        # finger to push and tilt the box.  Formal runs never see this signal
+        # and use the geometry/public-sensor gate below instead.
+        "touch_final_close_remaining": 0.085,
         # The box is wide enough that the final pinch-centre advance often
         # needs a little more time than the default 13 s window.  Keep the
         # final straight insert alive a bit longer before falling back.
         "creep_timeout": 20.0,
         "timeout_recovery_time": 5.0,
+        # If the chassis reaches the rack before the endpoint reaches the
+        # pinch window, perform one bounded IK-checked wrist advance instead
+        # of continuing to push the base into the shelf.
+        "creep_timeout_arm_extension": 0.045,
+        "creep_timeout_arm_extension_max_remaining": 0.120,
+        "creep_timeout_arm_extension_lateral": 0.030,
+        "creep_timeout_arm_slew": 0.25,
         "grip_close_dwell": 3.0,
         "post_grasp_hold_time": 0.60,
         "retreat_speed": 0.055,
@@ -887,7 +992,7 @@ PRODUCT_GRASP_PROFILES = {
         # The footprint closing axis is transformed by the shelf-facing base.
         # This pitch+yaw pair therefore closes across world Y, the 85 mm box
         # depth, not across its 172 mm world-X long face.
-        "wrist_pitch_deg": 90.0,
+        "wrist_pitch_deg": 58.0,
         "wrist_roll_deg": 0.0,
         "wrist_yaw_deg": 90.0,
         # During overhead deployment the camera sees a different surface of
@@ -897,7 +1002,17 @@ PRODUCT_GRASP_PROFILES = {
         "vision_monitor_max_shift_xy": 0.110,
         "vision_monitor_max_shift_z": 0.110,
         "vision_monitor_enabled": False,
-        "deploy_forward_offsets": (0.06, 0.0, 0.12, 0.18, 0.22),
+        # Balance shelf clearance and chassis creep.  The old 0.06 m candidate
+        # left 0.155 m to creep, while a 0.12 m experiment physically rotated
+        # the chassis during deploy.  A 0.09 m pre-extension leaves about
+        # 0.125 m and reaches the close window after the safe base advance.
+        # When desired_fp.x is 0.55, the 0.09/0.06 candidates are outside the
+        # IK branch and zero leaves too much chassis creep. Try the previously
+        # safe absolute neighbourhood around x=0.59 before falling back.
+        "deploy_forward_offsets": (0.09, 0.06, 0.04, 0.03, 0.12, 0.0, 0.18, 0.22),
+        "deploy_arm_slew": 0.35,
+        "deploy_timeout": 22.0,
+        "deploy_link4_max_z": 1.125,
     },
     "kouxiangtang": {
         "deploy_offset": np.array([0.004, -0.225, 0.030]),
@@ -1173,6 +1288,15 @@ SHELF_FINAL_DRIVE_TURN_LIMIT = float(os.getenv("SUPERMARKET_SHELF_FINAL_DRIVE_TU
 # the base beside the post line and the deploy sweeps rgt_arm_link3 into the
 # shelf structure (verified C1 at shelf_E_left_front_post).
 DEPLOY_MAX_YAW_ERR = float(os.getenv("SUPERMARKET_DEPLOY_MAX_YAW_ERR", "0.35"))
+DEPLOY_COLLISION_BASE_SHIFT = float(os.getenv(
+    "SUPERMARKET_DEPLOY_COLLISION_BASE_SHIFT", "0.035"
+))
+DEPLOY_COLLISION_YAW_SHIFT = float(os.getenv(
+    # A 0.09-rad shift reproduced in the official image was already enough to
+    # leave a settled tissue IK pose 5.7 cm lateral to its frozen world target.
+    # Re-acquire from the new base pose before that stale frame reaches creep.
+    "SUPERMARKET_DEPLOY_COLLISION_YAW_SHIFT", "0.075"
+))
 SLIDE_GRASP_BY_LEVEL = {
     "L1": 0.43,
     # L2/L3 used 0.11/0.06 (low slide).  Every C2 tipping in count5_full
@@ -1237,6 +1361,8 @@ class PickPlaceClient(Node):
         self.sub_idx = 0
         self.sub_entered = False
         self.deploy_set = False
+        self.deploy_joint_path = []
+        self.deploy_joint_path_index = 0
         self.place_sub = 0
         self.state_t0 = self.now()
         self.arm_target_set = False
@@ -1268,6 +1394,9 @@ class PickPlaceClient(Node):
         self.creep_heading_lock = None
         self.creep_timeout_recovery_until = 0.0
         self.creep_timeout_recovery_used = False
+        self.creep_arm_extension_active = False
+        self.creep_arm_extension_base_xy = None
+        self.creep_arm_extension_base_yaw = None
         self.close_arm_settle_since = None
         self.close_slow_slew = False
         self.execution_failed = False
@@ -1308,6 +1437,8 @@ class PickPlaceClient(Node):
         self.grasp_retry_retreat_active = False
         self.close_nudge_until = None
         self.close_nudge_done = False
+        self.place_arm_slow = False
+        self.place_arm_slew = PLACE_ARM_SLEW
         self.last_touch_creep_log = 0.0
         self.close_from_geometry = False
         self.close_attempted = False
@@ -1355,7 +1486,11 @@ class PickPlaceClient(Node):
         self.planner = SupermarketGridPlanner(
             resolution=float(os.getenv("SUPERMARKET_GRID_RESOLUTION", "0.10")),
             robot_radius=float(os.getenv("SUPERMARKET_ROBOT_CLEARANCE", "0.22")),
-            corridor_clearance=float(os.getenv("SUPERMARKET_CORRIDOR_CLEARANCE", "0.30")),
+            # Recovery A* must preserve the explicit shelf route's high
+            # divider crossing. With 0.30 m inflation, probe 15 pruned a
+            # recovery into a y=2.02 diagonal and the chassis clipped the
+            # divider repeatedly instead of reaching the grasp station.
+            corridor_clearance=float(os.getenv("SUPERMARKET_CORRIDOR_CLEARANCE", "0.65")),
         )
         self.loaded_planner = SupermarketGridPlanner(
             resolution=float(os.getenv("SUPERMARKET_GRID_RESOLUTION", "0.10")),
@@ -1447,13 +1582,12 @@ class PickPlaceClient(Node):
         if self.wrist_enabled:
             self.create_subscription(Image, "/right_camera/color/image_raw", self.wrist_image_cb, 4)
             self.create_subscription(CameraInfo, "/right_camera/color/camera_info", self.wrist_info_cb, 4)
-        # Always subscribe to /referee/state.  In formal runs the official
-        # referee is the only S5 authority, and the placement open-confirm
-        # timeout uses referee "completed" as a release proof (v40 fix for
-        # "gripper did not open" freezes).  The subscription itself is
-        # harmless - the state is only consulted as a timeout fallback in
-        # formal mode, never as the primary S5 gate (which stays local).
-        self.create_subscription(String, "/referee/state", self.referee_state_cb, 5)
+        # /referee/state is a local verification oracle and is not part of the
+        # official public interface.  Formal control must remain functional
+        # when the topic does not exist, so create this subscription only for
+        # explicitly requested local oracle runs.
+        if self.test_oracle_enabled:
+            self.create_subscription(String, "/referee/state", self.referee_state_cb, 5)
         # PR4: consume the perception ArUco-bound observations so the grasp
         # lock can require that THIS slot (aruco_id) was confirmed to hold the
         # detected kind - instead of trusting a bare detection near the static
@@ -1544,6 +1678,8 @@ class PickPlaceClient(Node):
         self.sub_idx = 0
         self.sub_entered = False
         self.deploy_set = False
+        self.deploy_joint_path = []
+        self.deploy_joint_path_index = 0
         self.place_sub = 0
         self.state_t0 = self.now()
         self.arm_target_set = False
@@ -1567,6 +1703,9 @@ class PickPlaceClient(Node):
         self.creep_heading_lock = None
         self.creep_timeout_recovery_until = 0.0
         self.creep_timeout_recovery_used = False
+        self.creep_arm_extension_active = False
+        self.creep_arm_extension_base_xy = None
+        self.creep_arm_extension_base_yaw = None
         self.close_arm_settle_since = None
         self.close_slow_slew = False
         self.execution_failed = False
@@ -2051,6 +2190,8 @@ class PickPlaceClient(Node):
         self.arm_target_set = False
         self.target_locked = False
         self.deploy_set = False
+        self.deploy_joint_path = []
+        self.deploy_joint_path_index = 0
         self.det_buf.clear()
         self.det_debug_counts = {}
         self.live_object_world = None
@@ -2067,6 +2208,9 @@ class PickPlaceClient(Node):
         self.creep_heading_lock = None
         self.creep_timeout_recovery_until = 0.0
         self.creep_timeout_recovery_used = False
+        self.creep_arm_extension_active = False
+        self.creep_arm_extension_base_xy = None
+        self.creep_arm_extension_base_yaw = None
         self.close_arm_settle_since = None
         self.close_slow_slew = False
         self.verify_start_xy = None
@@ -2266,7 +2410,7 @@ class PickPlaceClient(Node):
     def inventory_observation_cb(self, msg):
         """PR4: keep the ArUco-confirmed kind map for grasp re-verification.
 
-        Only ArUco-BOUND observations (schema v2 with a real aruco_id) update
+        Only ArUco-BOUND observations (schema v3 with a real aruco_id) update
         the map; unbound/rejected observations never claim a slot.  A
         previously confirmed identity can be replaced by a new consensus
         (e.g. after a disturbed/re-scanned slot), but a transient
@@ -2565,6 +2709,23 @@ class PickPlaceClient(Node):
         self.crumb_back_until = 0.0
         self.grasp_profile = self.profile_for_task(task)
         self.grasp_rot = self.grasp_rotation_for_task(task)
+        self.dual_hug_stage = 0
+        self.dual_hug_object_fp = None
+        self.dual_hug_joint_path = []
+        self.dual_hug_joint_path_index = 0
+        self.tissue_top_stage = 0
+        self.tissue_top_object_fp = None
+        self.tissue_top_target_fp = None
+        self.tissue_side_stage = 0
+        self.tissue_side_object_fp = None
+        self.tissue_side_target_fp = None
+        self.dual_hug_slide_target = float(self.grasp_profile.get(
+            "dual_hug_slide",
+            self.grasp_profile.get(
+                "grasp_slide",
+                SLIDE_GRASP_BY_LEVEL.get(getattr(task, "level", "L2"), SLIDE_GRASP),
+            ),
+        ))
         self.right_arm_top_box_post_blocked = requires_mirrored_left_arm(task)
         nav_y = float(self.grasp_profile.get("shelf_nav_y", nav_y))
         nav_x = (
@@ -2690,6 +2851,8 @@ class PickPlaceClient(Node):
         self.tc[2] = SLIDE_TRAVEL
         self.arm_target_set = False
         self.deploy_set = False
+        self.deploy_joint_path = []
+        self.deploy_joint_path_index = 0
         self.target_locked = False
         self.OBJECT_WORLD = None
         self.PINCH_WORLD = None
@@ -3161,6 +3324,14 @@ class PickPlaceClient(Node):
         return np.array([self.jpos.get(f"right_arm_joint{i+1}", self.tc[12 + i]) for i in range(6)])
 
     @property
+    def larm_meas(self):
+        return np.array([self.jpos.get(f"left_arm_joint{i+1}", self.tc[5 + i]) for i in range(6)])
+
+    @property
+    def lgripper_meas(self):
+        return float(self.jpos.get("left_arm_eef_gripper_joint", self.tc[11]))
+
+    @property
     def rgripper_meas(self):
         return float(self.jpos.get("right_arm_eef_gripper_joint", self.tc[18]))
 
@@ -3282,9 +3453,15 @@ class PickPlaceClient(Node):
             "deploy_forward_offsets",
             (0.18, 0.12, 0.06, 0.0, 0.22),
         ))
-        ref = np.zeros(7)
-        ref[0] = float(self.tc[2])
-        ref[1:] = self.rarm_meas
+        seed_joints = np.asarray(self.rarm_meas, dtype=float).copy()
+        # Plan in one consistent kinematic slice. The slide is commanded from
+        # travel to grasp height in this same DEPLOY tick; using its older
+        # measured height here makes even the unchanged first arm pose appear
+        # unreachable at the target height.
+        _, start_pose = self.kdl.forward_kinematics(
+            np.concatenate(([float(self.tc[2])], seed_joints)),
+            index="right",
+        )
         for forward_offset in forward_offsets:
             candidate_fp = desired_fp.copy()
             candidate_fp[0] += forward_offset
@@ -3292,24 +3469,67 @@ class PickPlaceClient(Node):
             T = np.eye(4)
             T[:3, :3] = rot
             T[:3, 3] = candidate_fp
-            sols = self.kdl.inverse_kinematics(
-                T_left=None,
-                T_right=T,
-                ref_pos=ref,
-                target_height=float(self.tc[2]),
+            poses = interpolate_se3(
+                start_pose,
+                T,
+                translation_step=CARTESIAN_DEPLOY_TRANSLATION_STEP,
+                rotation_step_rad=CARTESIAN_DEPLOY_ROTATION_STEP,
             )
-            if not sols:
+
+            def solve_pose(pose, previous):
+                ref = np.concatenate(([float(self.tc[2])], previous))
+                sols = self.kdl.inverse_kinematics(
+                    T_left=None,
+                    T_right=pose,
+                    ref_pos=ref,
+                    target_height=float(self.tc[2]),
+                )
+                return [np.asarray(sol, dtype=float)[1:7] for sol in (sols or ())]
+
+            result = plan_continuous_ik_path(
+                poses,
+                solve_pose,
+                seed_joints,
+                max_joint_step=CARTESIAN_DEPLOY_MAX_JOINT_STEP,
+            )
+            if not result.complete or not result.joint_path:
+                self.get_logger().info(
+                    "[deploy_path] rejected candidate: "
+                    f"offset={forward_offset:.3f} fraction={result.achieved_fraction:.2f} "
+                    f"reason={result.reason}"
+                )
                 continue
-            joints = np.asarray(sols[0], dtype=float)
-            if joints.shape != (7,) or not np.all(np.isfinite(joints)):
+            link_origins = self.right_arm_link_origins_footprint(
+                result.joint_path[-1],
+                float(self.tc[2]),
+            )
+            link4_z = float(link_origins[3][2])
+            link4_max_z = self.grasp_profile.get("deploy_link4_max_z")
+            if link4_max_z is not None and link4_z > float(link4_max_z):
+                self.get_logger().info(
+                    "[deploy_path] rejected shelf-clearance candidate: "
+                    f"offset={forward_offset:.3f} link4_z={link4_z:.3f} "
+                    f"limit={float(link4_max_z):.3f}"
+                )
                 continue
-            self.tc[12:18] = joints[1:7]
+            self.deploy_joint_path = [q.copy() for q in result.joint_path]
+            self.deploy_joint_path_index = 0
+            self.tc[12:18] = self.deploy_joint_path[0]
             self.arm_target_set = True
             self.DEPLOY_WORLD = candidate_world
+            max_jump = max(
+                float(np.max(np.abs(b - a)))
+                for a, b in zip(
+                    [seed_joints] + self.deploy_joint_path[:-1],
+                    self.deploy_joint_path,
+                )
+            )
             self.get_logger().info(
-                "[deploy] reachable short-axis box pre-pose selected: "
+                "[deploy_path] continuous short-axis box pre-pose selected: "
                 f"desired_fp={np.round(desired_fp, 3)} "
-                f"chosen_fp={np.round(candidate_fp, 3)}"
+                f"chosen_fp={np.round(candidate_fp, 3)} "
+                f"waypoints={len(self.deploy_joint_path)} max_jump={max_jump:.3f} "
+                f"link4_z={link4_z:.3f}"
             )
             return True
 
@@ -3319,10 +3539,1068 @@ class PickPlaceClient(Node):
         )
         return False
 
+    def dual_arm_hug_enabled(self):
+        return bool(self.grasp_profile.get("dual_arm_hug", False))
+
+    def tissue_side_pinch_enabled(self):
+        return bool(self.grasp_profile.get("tissue_side_pinch", False))
+
+    @staticmethod
+    def tissue_side_rotation():
+        # Calibrated KDL endpoint rotation for an inverted top pinch.  In the
+        # MuJoCo link6 collision frame local +Z points down through the thin
+        # tissue box, local Y spans its 85-mm shelf-depth side, and all bulky
+        # wrist collision bodies extend upward on local -Z.
+        return np.array([
+            [0.0, -1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [-1.0, 0.0, 0.0],
+        ])
+
+    def tissue_side_cartesian_error(self):
+        target = getattr(self, "tissue_side_target_fp", None)
+        if target is None:
+            return float("inf")
+        return float(np.linalg.norm(self.ee_footprint_pose()[:3, 3] - target))
+
+    def plan_tissue_side_cartesian_path(self, target_fp):
+        target_fp = np.asarray(target_fp, dtype=float)
+        # Seed the path from measured FK.  Starting from the commanded gateway
+        # can select a numerically equivalent but dynamically distant wrist
+        # solution and stall forever at waypoint zero.
+        _, start_pose = self.kdl.forward_kinematics(
+            np.concatenate(([float(self.slide_meas)], self.rarm_meas)),
+            index="right",
+        )
+        path_seed = np.asarray(self.rarm_meas, dtype=float)
+        goal = np.eye(4)
+        goal[:3, :3] = self.tissue_side_rotation()
+        goal[:3, 3] = target_fp
+        poses = interpolate_se3(
+            start_pose,
+            goal,
+            translation_step=CARTESIAN_DEPLOY_TRANSLATION_STEP,
+            rotation_step_rad=CARTESIAN_DEPLOY_ROTATION_STEP,
+        )
+
+        def solve_pose(pose, previous):
+            ref = np.concatenate(([float(self.tc[2])], previous))
+            solutions = self.kdl.inverse_kinematics(
+                T_right=pose,
+                ref_pos=ref,
+                target_height=float(self.tc[2]),
+            )
+            return [np.asarray(solution, dtype=float)[1:7] for solution in (solutions or ())]
+
+        result = plan_continuous_ik_path(
+            poses,
+            solve_pose,
+            path_seed,
+            # This sideways wrist orientation crosses a bounded branch bend
+            # near 75% insertion.  Offline sweeps across all legal shelf
+            # standoffs measured a safe upper step below 0.45 rad.
+            max_joint_step=0.45,
+        )
+        if not result.complete or not result.joint_path:
+            self.get_logger().warn(
+                "[tissue_side] Cartesian path rejected: "
+                f"fraction={result.achieved_fraction:.2f} reason={result.reason}"
+            )
+            return False
+        self.deploy_joint_path = [joints.copy() for joints in result.joint_path]
+        # interpolate_se3 includes the start pose.  Preserve the exact measured
+        # joint representative for it rather than commanding another IK branch
+        # for an identical Cartesian pose.
+        self.deploy_joint_path[0] = path_seed.copy()
+        self.deploy_joint_path_index = 0
+        self.deploy_joint_waypoint_since = None
+        self.tc[12:18] = self.deploy_joint_path[0]
+        self.tissue_side_target_fp = target_fp.copy()
+        self.arm_target_set = True
+        self.get_logger().info(
+            f"[tissue_side] planned Cartesian path: waypoints={len(self.deploy_joint_path)} "
+            f"target_fp={np.round(target_fp, 3)}"
+        )
+        return True
+
+    def tick_tissue_side_pinch(self):
+        """Insert an inverted top pinch, clamp shelf depth, then pull forward."""
+        self.set_twist(0.0, 0.0)
+        self.tc[4] = HEAD_PITCH
+        slide = float(self.grasp_profile.get("tissue_side_slide", 0.450))
+        self.tc[2] = slide
+        stage = int(getattr(self, "tissue_side_stage", 0))
+
+        yaw_error = wrap_to_pi(float(self.grasp_yaw) - float(self.base_yaw))
+        if stage == 0 and abs(yaw_error) > 0.025:
+            self.set_twist(0.0, float(np.clip(1.4 * yaw_error, -0.22, 0.22)))
+            return
+
+        if not self.target_locked:
+            elapsed = self.now() - self.state_t0
+            locked = elapsed >= DETECT_DWELL and self._lock_target()
+            if not locked and elapsed > DIRECT_TASK_DETECT_TIMEOUT:
+                locked = (
+                    self.lock_direct_task_geometry_fallback()
+                    or self.lock_inventory_geometry_fallback()
+                )
+            if not locked:
+                if elapsed > DETECT_TIMEOUT:
+                    self.fail_current_execution("tissue side pinch could not lock target")
+                return
+        if self.tissue_side_object_fp is None:
+            self.tissue_side_object_fp = self.world_to_footprint(self.OBJECT_WORLD)
+        centre = np.asarray(self.tissue_side_object_fp, dtype=float)
+        tip_standoff = float(
+            self.grasp_profile.get("tissue_side_tip_standoff", 0.106)
+        )
+        z_bias = float(self.grasp_profile.get("tissue_side_endpoint_z_bias", -0.008))
+        depth_bias = float(self.grasp_profile.get("tissue_side_depth_bias", -0.015))
+        grasp_target = centre + np.array([depth_bias, tip_standoff, z_bias])
+        outer_clearance = float(
+            self.grasp_profile.get("tissue_side_outer_clearance", 0.145)
+        )
+        outer_delta = outer_clearance - tip_standoff
+        elapsed = self.now() - self.state_t0
+
+        if stage == 0:
+            retract = float(self.grasp_profile.get("tissue_side_front_retract", 0.240))
+            target = grasp_target + np.array([-retract, outer_delta, 0.0])
+            self.tc[18] = float(self.grasp_profile.get("grip_preopen", GRIP_OPEN))
+            if not self.arm_to(
+                self.footprint_to_world(target), rot=self.tissue_side_rotation()
+            ):
+                self.fail_current_execution("tissue side front gateway IK failed")
+                return
+            self.tissue_side_target_fp = target
+            self.place_arm_slow = True
+            self.place_arm_slew = float(self.grasp_profile.get("deploy_arm_slew", 0.24))
+            self.tissue_side_stage = 1
+            self.state_t0 = self.now()
+            self.get_logger().info(
+                f"[tissue_side] approaching C1 outer channel: target_fp={np.round(target, 3)}"
+            )
+            return
+
+        joint_error = float(np.max(np.abs(self.rarm_meas - self.tc[12:18])))
+        cart_error = self.tissue_side_cartesian_error()
+        if stage == 1:
+            # The last wrist joint is redundant for this symmetric pinch and
+            # can remain about 0.1 rad from the selected IK representative
+            # even after the Cartesian endpoint has settled.  The continuous
+            # path is seeded from measured FK below, so Cartesian proximity is
+            # the safety-critical gateway condition.
+            if joint_error < 0.20 and cart_error < 0.060 and elapsed > 0.8:
+                # First align shelf depth while the whole gripper is still
+                # outside the long side of the tissue box.  Entering directly
+                # along the closing axis makes the 80-mm open gap push the
+                # 85-mm box before both fingers can straddle it.
+                target = grasp_target + np.array([0.0, outer_delta, 0.0])
+                if not self.plan_tissue_side_cartesian_path(target):
+                    self.fail_current_execution("tissue side insertion path failed")
+                    return
+                self.tissue_side_stage = 2
+                self.state_t0 = self.now()
+                self.get_logger().info(
+                    "[tissue_side] aligning depth outside the tissue long edge"
+                )
+            elif elapsed > 28.0:
+                self.get_logger().warn(
+                    "[tissue_side] gateway timeout diagnostics: "
+                    f"joint_error={joint_error:.3f} cart_error={cart_error:.3f}"
+                )
+                self.fail_current_execution("tissue side front gateway did not settle")
+            return
+
+        if stage == 2:
+            complete = self.advance_deploy_joint_path(
+                float(self.grasp_profile.get("tissue_side_waypoint_tolerance", 0.120)),
+                min_dwell=float(
+                    self.grasp_profile.get("tissue_side_waypoint_dwell", 0.30)
+                ),
+            )
+            if complete and cart_error < 0.045:
+                if not self.plan_tissue_side_cartesian_path(grasp_target):
+                    self.fail_current_execution("tissue edge-contact path failed")
+                    return
+                self.tissue_side_stage = 3
+                self.state_t0 = self.now()
+                self.get_logger().info(
+                    "[tissue_side] depth aligned; moving both fingers to outer edge: "
+                    f"ee_fp={np.round(self.ee_footprint_pose()[:3, 3], 3)} "
+                    f"q_meas={np.round(self.rarm_meas, 4)} "
+                    f"q_cmd={np.round(self.tc[12:18], 4)} "
+                    f"q_sent={np.round(self.action[12:18], 4)}"
+                )
+            elif elapsed > 28.0:
+                self.get_logger().warn(
+                    "[tissue_side] insertion timeout diagnostics: "
+                    f"waypoint={self.deploy_joint_path_index + 1}/"
+                    f"{len(self.deploy_joint_path)} joint_error={joint_error:.3f} "
+                    f"cart_error={cart_error:.3f}"
+                )
+                self.fail_current_execution("tissue side insertion did not settle")
+            return
+
+        if stage == 3:
+            complete = self.advance_deploy_joint_path(
+                float(
+                    self.grasp_profile.get(
+                        "tissue_side_edge_waypoint_tolerance", 0.012
+                    )
+                ),
+                min_dwell=float(
+                    self.grasp_profile.get("tissue_side_waypoint_dwell", 0.30)
+                ),
+            )
+            # This path is only 20 mm long.  Reusing the 0.12-rad tolerance
+            # from the 200-mm insertion allowed all three waypoints to be
+            # consumed before the actuator had moved at all, then closed the
+            # gripper at the outside pose.  Require the real measured joints
+            # and endpoint to settle at the edge before commanding closure.
+            contact_blocked = (
+                elapsed > 1.20
+                and self.deploy_joint_path_index >= len(self.deploy_joint_path) - 1
+                and float(np.max(np.abs(self.action[12:18] - self.tc[12:18]))) < 0.010
+                and cart_error < 0.030
+            )
+            if (complete and cart_error < 0.010) or contact_blocked:
+                self.tc[18] = float(
+                    self.grasp_profile.get("grip_close_target", GRIP_CLOSE)
+                )
+                self.close_slow_slew = True
+                self.tissue_side_stage = 4
+                self.state_t0 = self.now()
+                self.get_logger().info(
+                    "[tissue_side] dual-finger edge pose complete; clamping depth: "
+                    f"contact_blocked={contact_blocked} "
+                    f"ee_fp={np.round(self.ee_footprint_pose()[:3, 3], 3)} "
+                    f"q_meas={np.round(self.rarm_meas, 4)} "
+                    f"q_cmd={np.round(self.tc[12:18], 4)} "
+                    f"q_sent={np.round(self.action[12:18], 4)}"
+                )
+            elif elapsed > 8.0:
+                self.fail_current_execution("tissue edge-contact path did not settle")
+            return
+
+        if stage == 4:
+            # From fully open, an empty gripper needs about 3.6 s at the slow
+            # slew rate to reach zero.  Checking earlier mislabels the still-
+            # closing position as an occupied grasp.
+            if elapsed > 4.5:
+                holding = self.gripper_holding_object()
+                self.get_logger().info(
+                    "[tissue_side] clamp dwell complete: "
+                    f"holding={holding} grip_pos={self.rgripper_meas:.3f} "
+                    f"effort={self.rgripper_effort:.3f}"
+                )
+                if not holding:
+                    self.fail_current_execution("tissue side clamp remained empty")
+                    return
+                pull = float(self.grasp_profile.get("tissue_side_extract", 0.230))
+                lift = float(self.grasp_profile.get("tissue_side_extract_lift", 0.020))
+                target = grasp_target + np.array([-pull, 0.0, lift])
+                if not self.plan_tissue_side_cartesian_path(target):
+                    self.fail_current_execution("tissue side extraction path failed")
+                    return
+                self.close_slow_slew = False
+                self.tissue_side_stage = 5
+                self.state_t0 = self.now()
+                self.get_logger().info(f"[tissue_side] extracting forward {pull:.3f} m")
+            return
+
+        if stage == 5:
+            complete = self.advance_deploy_joint_path(
+                float(self.grasp_profile.get("tissue_side_waypoint_tolerance", 0.120)),
+                min_dwell=float(
+                    self.grasp_profile.get("tissue_side_waypoint_dwell", 0.30)
+                ),
+            )
+            if complete and cart_error < 0.060:
+                self.place_arm_slow = False
+                self.place_arm_slew = PLACE_ARM_SLEW
+                self.begin_delivery_after_grasp(
+                    "public-sensor side-pinch/forward-extract sequence completed"
+                )
+            elif elapsed > 36.0:
+                self.fail_current_execution("tissue side extraction did not settle")
+            return
+
+    def tissue_top_pinch_enabled(self):
+        return bool(self.grasp_profile.get("tissue_top_pinch", False))
+
+    @staticmethod
+    def tissue_top_rotation():
+        # KDL endpoint -> MuJoCo link6 has a fixed axis permutation.  This
+        # calibrated endpoint rotation makes the *physical* link6 local -X
+        # (the long finger-pad direction) point down and local Y (finger
+        # closing) span the shelf-depth short side.  The older matrix placed
+        # the finger length horizontally and could only push the box sideways.
+        return np.array([
+            [0.0, 1.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 0.0, -1.0],
+        ])
+
+    def tissue_top_cartesian_error(self):
+        target = getattr(self, "tissue_top_target_fp", None)
+        if target is None:
+            return float("inf")
+        return float(np.linalg.norm(self.ee_footprint_pose()[:3, 3] - target))
+
+    def plan_tissue_top_cartesian_path(self, target_fp):
+        target_fp = np.asarray(target_fp, dtype=float)
+        _, start_pose = self.kdl.forward_kinematics(
+            np.concatenate(([float(self.slide_meas)], self.rarm_meas)),
+            index="right",
+        )
+        goal = np.eye(4)
+        goal[:3, :3] = self.tissue_top_rotation()
+        goal[:3, 3] = target_fp
+        poses = interpolate_se3(
+            start_pose,
+            goal,
+            translation_step=CARTESIAN_DEPLOY_TRANSLATION_STEP,
+            rotation_step_rad=CARTESIAN_DEPLOY_ROTATION_STEP,
+        )
+
+        def solve_pose(pose, previous):
+            ref = np.concatenate(([float(self.tc[2])], previous))
+            solutions = self.kdl.inverse_kinematics(
+                T_right=pose,
+                ref_pos=ref,
+                target_height=float(self.tc[2]),
+            )
+            return [np.asarray(solution, dtype=float)[1:7] for solution in (solutions or ())]
+
+        result = plan_continuous_ik_path(
+            poses,
+            solve_pose,
+            np.asarray(self.rarm_meas, dtype=float),
+            max_joint_step=CARTESIAN_DEPLOY_MAX_JOINT_STEP,
+        )
+        if not result.complete or not result.joint_path:
+            self.get_logger().warn(
+                "[tissue_top] Cartesian path rejected: "
+                f"fraction={result.achieved_fraction:.2f} reason={result.reason}"
+            )
+            return False
+        self.deploy_joint_path = [joints.copy() for joints in result.joint_path]
+        self.deploy_joint_path_index = 0
+        self.tc[12:18] = self.deploy_joint_path[0]
+        self.tissue_top_target_fp = target_fp.copy()
+        self.arm_target_set = True
+        self.get_logger().info(
+            f"[tissue_top] planned Cartesian path: waypoints={len(self.deploy_joint_path)} "
+            f"target_fp={np.round(target_fp, 3)}"
+        )
+        return True
+
+    def tick_tissue_top_pinch(self):
+        """Top-envelop the tissue after a collision-safe outside-shelf gateway."""
+        self.set_twist(0.0, 0.0)
+        self.tc[4] = HEAD_PITCH
+        stage = int(getattr(self, "tissue_top_stage", 0))
+        base_slide = float(self.grasp_profile.get("tissue_top_slide", 0.500))
+        lift = float(self.grasp_profile.get("tissue_top_lift", 0.080))
+        # Complete the large wrist reorientation in front of the rack at full
+        # spine height.  Only Cartesian translations are allowed once the
+        # fingers cross the shelf front plane.
+        if stage <= 1:
+            self.tc[2] = SLIDE_TRAVEL
+        elif stage <= 5:
+            self.tc[2] = base_slide
+        else:
+            self.tc[2] = max(-0.034, base_slide - lift)
+
+        yaw_error = wrap_to_pi(float(self.grasp_yaw) - float(self.base_yaw))
+        if stage == 0 and abs(yaw_error) > 0.025:
+            self.set_twist(0.0, float(np.clip(1.4 * yaw_error, -0.22, 0.22)))
+            return
+
+        if not self.target_locked:
+            elapsed = self.now() - self.state_t0
+            locked = elapsed >= DETECT_DWELL and self._lock_target()
+            if not locked and elapsed > DIRECT_TASK_DETECT_TIMEOUT:
+                locked = (
+                    self.lock_direct_task_geometry_fallback()
+                    or self.lock_inventory_geometry_fallback()
+                )
+            if not locked:
+                if elapsed > DETECT_TIMEOUT:
+                    self.fail_current_execution("tissue top pinch could not lock target")
+                return
+        if self.tissue_top_object_fp is None:
+            self.tissue_top_object_fp = self.world_to_footprint(self.OBJECT_WORLD)
+        centre = np.asarray(self.tissue_top_object_fp, dtype=float) + np.array([
+            float(self.grasp_profile.get("tissue_top_depth_bias", 0.0)),
+            float(self.grasp_profile.get("tissue_top_lateral_bias", 0.0)),
+            0.0,
+        ])
+        rotation = self.tissue_top_rotation()
+        elapsed = self.now() - self.state_t0
+
+        if stage == 0:
+            pre_z = float(self.grasp_profile.get("tissue_top_pre_z", 0.200))
+            retract = float(self.grasp_profile.get("tissue_top_gateway_retract", 0.300))
+            target = centre + np.array([
+                -retract, 0.0, pre_z + base_slide - SLIDE_TRAVEL
+            ])
+            self.tc[18] = float(self.grasp_profile.get("grip_preopen", GRIP_OPEN))
+            if not self.arm_to(self.footprint_to_world(target), rot=rotation):
+                self.fail_current_execution("tissue top outside gateway IK failed")
+                return
+            self.tissue_top_target_fp = target
+            self.place_arm_slow = True
+            self.place_arm_slew = float(self.grasp_profile.get("deploy_arm_slew", 0.24))
+            self.tissue_top_stage = 1
+            self.state_t0 = self.now()
+            self.get_logger().info(
+                f"[tissue_top] orienting fingers outside shelf at travel height: "
+                f"target_fp={np.round(target, 3)}"
+            )
+            return
+
+        joint_error = float(np.max(np.abs(self.rarm_meas - self.tc[12:18])))
+        cart_error = self.tissue_top_cartesian_error()
+        if stage == 1:
+            joint_errors = np.abs(self.rarm_meas - self.tc[12:18])
+            ee_fp = self.ee_footprint_pose()[:3, 3]
+            full_gateway_ready = (
+                joint_error < 0.08
+                and cart_error < 0.050
+                and elapsed > 0.8
+            )
+            # In the outside posture wrist joint 5 can temporarily saturate
+            # against gravity while all proximal joints are already safe.  A
+            # Cartesian forward-and-orient segment reduces that moment arm.
+            # Starting that segment from measured FK also avoids commanding a
+            # large wrist step against the torque limit.
+            proximal_ready = (
+                elapsed > 5.0
+                and float(np.max(joint_errors[[0, 1, 2, 3, 5]])) < 0.16
+                and float(ee_fp[2]) > float(centre[2] + 0.45)
+                and float(ee_fp[0]) < float(centre[0] - 0.15)
+            )
+            if full_gateway_ready or proximal_ready:
+                # Lower only while the entire arm is still outside the rack.
+                # Lowering after insertion sweeps link3 through the L3 board.
+                target = ee_fp + np.array([0.0, 0.0, SLIDE_TRAVEL - base_slide])
+                self.tissue_top_target_fp = target
+                self.tc[2] = base_slide
+                self.tissue_top_stage = 2
+                self.state_t0 = self.now()
+                self.get_logger().info(
+                    "[tissue_top] outside gateway ready; lowering spine outside rack: "
+                    f"full={full_gateway_ready} joint_errs={np.round(joint_errors, 3)} "
+                    f"ee_fp={np.round(ee_fp, 3)}"
+                )
+            elif elapsed > 32.0:
+                self.fail_current_execution("tissue top outside gateway did not settle")
+            return
+
+        if stage == 2:
+            if (
+                abs(float(self.slide_meas) - base_slide) < 0.020
+                and cart_error < 0.060
+                and elapsed > 0.8
+            ):
+                pre_z = float(self.grasp_profile.get("tissue_top_pre_z", 0.200))
+                target = centre + np.array([0.0, 0.0, pre_z])
+                if not self.plan_tissue_top_cartesian_path(target):
+                    self.fail_current_execution("tissue top low insertion path failed")
+                    return
+                self.tissue_top_stage = 3
+                self.state_t0 = self.now()
+                self.get_logger().info(
+                    "[tissue_top] spine lowered outside rack; inserting above target"
+                )
+            elif elapsed > 24.0:
+                self.fail_current_execution("tissue top outside lowering did not settle")
+            return
+
+        if stage == 3:
+            complete = self.advance_deploy_joint_path(
+                float(self.grasp_profile.get("tissue_top_waypoint_tolerance", 0.025)),
+                min_dwell=float(
+                    self.grasp_profile.get("tissue_top_waypoint_dwell", 0.18)
+                ),
+            )
+            if complete and cart_error < 0.050:
+                grasp_z = float(self.grasp_profile.get("tissue_top_grasp_z", 0.100))
+                target = centre + np.array([0.0, 0.0, grasp_z])
+                if not self.plan_tissue_top_cartesian_path(target):
+                    self.fail_current_execution("tissue top descent path failed")
+                    return
+                self.tissue_top_stage = 4
+                self.state_t0 = self.now()
+                self.get_logger().info("[tissue_top] descending vertically around box")
+            elif elapsed > 24.0:
+                self.fail_current_execution("tissue top low insertion did not settle")
+            return
+
+        if stage == 4:
+            complete = self.advance_deploy_joint_path(
+                float(self.grasp_profile.get("tissue_top_waypoint_tolerance", 0.025)),
+                min_dwell=float(
+                    self.grasp_profile.get("tissue_top_waypoint_dwell", 0.18)
+                ),
+            )
+            if complete and cart_error < 0.040:
+                self.tc[18] = float(self.grasp_profile.get("grip_close_target", GRIP_CLOSE))
+                self.close_slow_slew = True
+                self.tissue_top_stage = 5
+                self.state_t0 = self.now()
+                self.get_logger().info("[tissue_top] fingers envelop box; closing short axis")
+            elif elapsed > 24.0:
+                self.fail_current_execution("tissue top descent did not settle")
+            return
+
+        if stage == 5:
+            if elapsed > 4.5:
+                holding = self.gripper_holding_object()
+                if not holding:
+                    self.fail_current_execution("tissue top clamp remained empty")
+                    return
+                self.tissue_top_stage = 6
+                self.state_t0 = self.now()
+                self.get_logger().info(
+                    f"[tissue_top] clamp dwell complete: holding={holding} "
+                    f"grip_pos={self.rgripper_meas:.3f} "
+                    f"effort={self.rgripper_effort:.3f} joint_err={joint_error:.3f}; "
+                    f"lifting {lift:.3f} m"
+                )
+            return
+
+        if stage == 6:
+            self.close_slow_slew = False
+            if abs(float(self.slide_meas) - float(self.tc[2])) < 0.020 and elapsed > 0.8:
+                pull = float(self.grasp_profile.get("tissue_top_pull", 0.280))
+                grasp_z = float(self.grasp_profile.get("tissue_top_grasp_z", 0.100))
+                target = centre + np.array([-pull, 0.0, grasp_z + lift])
+                if not self.plan_tissue_top_cartesian_path(target):
+                    self.fail_current_execution("tissue top extraction path failed")
+                    return
+                self.tissue_top_stage = 7
+                self.state_t0 = self.now()
+                self.get_logger().info(f"[tissue_top] extracting box {pull:.3f} m")
+            elif elapsed > 8.0:
+                self.fail_current_execution("tissue top lift did not settle")
+            return
+
+        if stage == 7:
+            complete = self.advance_deploy_joint_path(
+                float(self.grasp_profile.get("tissue_top_waypoint_tolerance", 0.025)),
+                min_dwell=float(
+                    self.grasp_profile.get("tissue_top_waypoint_dwell", 0.18)
+                ),
+            )
+            if complete and cart_error < 0.060:
+                self.place_arm_slow = False
+                self.place_arm_slew = PLACE_ARM_SLEW
+                self.begin_delivery_after_grasp(
+                    "public-sensor top pinch/lift/extract sequence completed"
+                )
+            elif elapsed > 36.0:
+                self.fail_current_execution("tissue top extraction did not settle")
+            return
+
+    def arms_to_dual_hug(
+        self,
+        lateral,
+        *,
+        pull_distance=0.0,
+        lifted=False,
+        continuous=False,
+        gateway_rotation=False,
+        z_offset_override=None,
+    ):
+        """Command the symmetric MMK2 box-hug pose from DISCOVERSE upstream.
+
+        The upstream demonstration approaches a wide box with both arms at
+        +/-150 mm, squeezes to +/-80 mm, lifts the spine and only then pulls
+        along the shelf opening.  Its left/right wrist rotations are swapped
+        here because this project's KDL footprint convention is the transpose
+        of the demo environment's `get_tmat_wrt_mmk2base` convention.
+        """
+        if self.OBJECT_WORLD is None:
+            return False
+        if self.dual_hug_object_fp is None:
+            self.dual_hug_object_fp = self.world_to_footprint(self.OBJECT_WORLD)
+        # Freeze the first shelf-relative target.  Recomputing it after a
+        # contact-induced chassis shift makes both arms chase the box deeper
+        # into the rack (the exact implicit-footprint-refresh failure reported
+        # against DISCOVERSE's box task).
+        centre = np.asarray(self.dual_hug_object_fp, dtype=float)
+        z_offset = float(
+            self.grasp_profile.get("dual_hug_z_offset", 0.130)
+            if z_offset_override is None
+            else z_offset_override
+        )
+        if lifted:
+            z_offset += float(self.grasp_profile.get("dual_hug_lift", 0.080))
+        pitch_bias = -0.0551 + math.pi
+        explicit_left = self.grasp_profile.get("dual_hug_left_euler")
+        explicit_right = self.grasp_profile.get("dual_hug_right_euler")
+        if (
+            not gateway_rotation
+            and explicit_left is not None
+            and explicit_right is not None
+        ):
+            left_rot = Rotation.from_euler("zyx", explicit_left).as_matrix()
+            right_rot = Rotation.from_euler("zyx", explicit_right).as_matrix()
+        else:
+            wrist_cant = float(self.grasp_profile.get(
+                "dual_hug_wrist_cant",
+                math.pi / 7.0 if lifted else math.pi / 8.0,
+            ))
+            left_rot = Rotation.from_euler(
+                "zyx", [-math.pi / 2.0, pitch_bias, -wrist_cant]
+            ).as_matrix()
+            right_rot = Rotation.from_euler(
+                "zyx", [math.pi / 2.0, pitch_bias, wrist_cant]
+            ).as_matrix()
+        left_T = np.eye(4)
+        right_T = np.eye(4)
+        left_T[:3, :3] = left_rot
+        right_T[:3, :3] = right_rot
+        crossed = bool(self.grasp_profile.get("dual_hug_crossed", False))
+        side_sign = -1.0 if crossed else 1.0
+        left_T[:3, 3] = centre + np.array([
+            -pull_distance, side_sign * lateral, z_offset
+        ])
+        right_T[:3, 3] = centre + np.array([
+            -pull_distance, -side_sign * lateral, z_offset
+        ])
+        ref = np.concatenate((
+            [float(self.tc[2])],
+            np.asarray(self.larm_meas, dtype=float),
+            np.asarray(self.rarm_meas, dtype=float),
+        ))
+        sols = self.kdl.inverse_kinematics(
+            T_left=left_T,
+            T_right=right_T,
+            ref_pos=ref,
+            target_height=float(self.tc[2]),
+        )
+        if not sols:
+            self.get_logger().warn(
+                "[dual_hug] IK unreachable: "
+                f"centre_fp={np.round(centre, 3)} lateral={lateral:.3f} "
+                f"pull={pull_distance:.3f} lifted={lifted}"
+            )
+            return False
+        joints = np.asarray(sols[0], dtype=float)
+        if joints.shape != (13,) or not np.all(np.isfinite(joints)):
+            self.get_logger().warn("[dual_hug] IK returned an invalid dual-arm solution")
+            return False
+        if continuous:
+            if not self.plan_dual_arm_cartesian_path(left_T, right_T):
+                return False
+        else:
+            self.dual_hug_joint_path = []
+            self.dual_hug_joint_path_index = 0
+            self.tc[5:11] = joints[1:7]
+            self.tc[12:18] = joints[7:13]
+        # The grippers act as compact high-friction pads; the arm spacing is
+        # the actual wide-box clamp actuator.
+        self.tc[11] = GRIP_CLOSE
+        self.tc[18] = GRIP_CLOSE
+        self.arm_target_set = True
+        self.dual_hug_target_left_fp = left_T[:3, 3].copy()
+        self.dual_hug_target_right_fp = right_T[:3, 3].copy()
+        return True
+
+    def plan_dual_arm_cartesian_path(self, left_goal, right_goal):
+        left_start, right_start = self.kdl.forward_kinematics(
+            np.concatenate((
+                [float(self.slide_meas)],
+                np.asarray(self.larm_meas, dtype=float),
+                np.asarray(self.rarm_meas, dtype=float),
+            ))
+        )
+        left_poses = interpolate_se3(
+            left_start,
+            left_goal,
+            translation_step=CARTESIAN_DEPLOY_TRANSLATION_STEP,
+            rotation_step_rad=CARTESIAN_DEPLOY_ROTATION_STEP,
+        )
+        right_poses = interpolate_se3(
+            right_start,
+            right_goal,
+            translation_step=CARTESIAN_DEPLOY_TRANSLATION_STEP,
+            rotation_step_rad=CARTESIAN_DEPLOY_ROTATION_STEP,
+        )
+        # Measured arms are never perfectly symmetric, so their minimum
+        # sample counts can differ by one. Re-sample both on the denser grid;
+        # pairing independent grids would desynchronise the clamp.
+        synchronized_segments = max(len(left_poses), len(right_poses))
+        if len(left_poses) != synchronized_segments:
+            left_poses = interpolate_se3(
+                left_start,
+                left_goal,
+                translation_step=CARTESIAN_DEPLOY_TRANSLATION_STEP,
+                rotation_step_rad=CARTESIAN_DEPLOY_ROTATION_STEP,
+                segments=synchronized_segments,
+            )
+        if len(right_poses) != synchronized_segments:
+            right_poses = interpolate_se3(
+                right_start,
+                right_goal,
+                translation_step=CARTESIAN_DEPLOY_TRANSLATION_STEP,
+                rotation_step_rad=CARTESIAN_DEPLOY_ROTATION_STEP,
+                segments=synchronized_segments,
+            )
+        paired = list(zip(left_poses, right_poses))
+
+        def solve_pair(pair, previous):
+            left_pose, right_pose = pair
+            ref = np.concatenate(([float(self.tc[2])], previous))
+            sols = self.kdl.inverse_kinematics(
+                T_left=left_pose,
+                T_right=right_pose,
+                ref_pos=ref,
+                target_height=float(self.tc[2]),
+            )
+            return [np.asarray(sol, dtype=float)[1:13] for sol in (sols or ())]
+
+        seed = np.concatenate((self.larm_meas, self.rarm_meas))
+        result = plan_continuous_ik_path(
+            paired,
+            solve_pair,
+            seed,
+            max_joint_step=CARTESIAN_DEPLOY_MAX_JOINT_STEP,
+        )
+        if not result.complete or not result.joint_path:
+            self.get_logger().warn(
+                "[dual_hug] continuous path rejected: "
+                f"fraction={result.achieved_fraction:.2f} reason={result.reason}"
+            )
+            return False
+        self.dual_hug_joint_path = [q.copy() for q in result.joint_path]
+        self.dual_hug_joint_path_index = 0
+        # At the deliberately low shelf-motion slew, a 0.3 rad admissible IK
+        # step can require about 1.25 s to settle.  Keep a path-sized deadline
+        # instead of the old fixed 16 s, which rejected healthy 23-point gap
+        # insertions before they could finish.
+        self.dual_hug_path_timeout = max(
+            16.0, 1.45 * len(self.dual_hug_joint_path) + 2.0
+        )
+        self.dual_hug_progress_log_at = self.now()
+        self.tc[5:11] = self.dual_hug_joint_path[0][:6]
+        self.tc[12:18] = self.dual_hug_joint_path[0][6:]
+        self.get_logger().info(
+            f"[dual_hug] planned synchronized Cartesian path: "
+            f"waypoints={len(self.dual_hug_joint_path)}"
+        )
+        return True
+
+    def advance_dual_hug_joint_path(self):
+        if not self.dual_hug_joint_path:
+            return True
+        measured = np.concatenate((self.larm_meas, self.rarm_meas))
+        commanded = np.concatenate((self.tc[5:11], self.tc[12:18]))
+        joint_error = float(np.max(np.abs(measured - commanded)))
+        cart_error = self.dual_hug_cartesian_error()
+        waypoint_tolerance = float(
+            self.grasp_profile.get("dual_hug_waypoint_tolerance", 0.090)
+        )
+        now = self.now()
+        if now - float(getattr(self, "dual_hug_progress_log_at", 0.0)) > 2.0:
+            self.get_logger().info(
+                "[dual_hug] Cartesian progress: "
+                f"waypoint={self.dual_hug_joint_path_index + 1}/"
+                f"{len(self.dual_hug_joint_path)} joint_err={joint_error:.3f} "
+                f"goal_cart_err={cart_error:.3f}"
+            )
+            self.dual_hug_progress_log_at = now
+        if joint_error > waypoint_tolerance:
+            remaining = len(self.dual_hug_joint_path) - self.dual_hug_joint_path_index
+            # Close shelf contacts can leave an underactuated wrist joint a
+            # few degrees off while both endpoints are already geometrically
+            # inside the side gaps. In the final path quarter, accept an
+            # endpoint at least 12 mm beyond this box's front face instead of
+            # integrating joint force against a contact. The following squeeze
+            # remains symmetric and bounded.
+            terminal_window = max(4, int(math.ceil(0.25 * len(self.dual_hug_joint_path))))
+            if remaining <= terminal_window and cart_error < 0.030:
+                self.get_logger().info(
+                    "[dual_hug] accepting contact-constrained Cartesian endpoint: "
+                    f"remaining={remaining} joint_err={joint_error:.3f} "
+                    f"goal_cart_err={cart_error:.3f}"
+                )
+                self.dual_hug_joint_path = []
+                return True
+            return False
+        next_index = self.dual_hug_joint_path_index + 1
+        if next_index >= len(self.dual_hug_joint_path):
+            self.dual_hug_joint_path = []
+            return True
+        self.dual_hug_joint_path_index = next_index
+        joints = self.dual_hug_joint_path[next_index]
+        self.tc[5:11] = joints[:6]
+        self.tc[12:18] = joints[6:]
+        return False
+
+    def dual_hug_joint_error(self):
+        return max(
+            float(np.max(np.abs(self.larm_meas - self.tc[5:11]))),
+            float(np.max(np.abs(self.rarm_meas - self.tc[12:18]))),
+        )
+
+    def dual_hug_cartesian_error(self):
+        left_T, right_T = self.kdl.forward_kinematics(
+            np.concatenate((
+                [float(self.slide_meas)],
+                np.asarray(self.larm_meas, dtype=float),
+                np.asarray(self.rarm_meas, dtype=float),
+            ))
+        )
+        left_target = getattr(self, "dual_hug_target_left_fp", None)
+        right_target = getattr(self, "dual_hug_target_right_fp", None)
+        if left_target is None or right_target is None:
+            return float("inf")
+        return max(
+            float(np.linalg.norm(left_T[:3, 3] - left_target)),
+            float(np.linalg.norm(right_T[:3, 3] - right_target)),
+        )
+
+    def tick_dual_arm_hug(self):
+        """Run a bounded dual-arm hug/lift/pull pickup without referee truth."""
+        self.set_twist(0.0, 0.0)
+        self.tc[4] = HEAD_PITCH
+        self.tc[2] = float(getattr(self, "dual_hug_slide_target", self.grasp_slide))
+        stage = int(getattr(self, "dual_hug_stage", 0))
+
+        # A single-arm grasp tolerates several degrees of shelf-facing yaw,
+        # but a symmetric two-arm IK target does not: at 0.10 rad the box
+        # appears 57 mm off the base centreline and one arm exits its lateral
+        # workspace.  Square the chassis in place before locking geometry.
+        if stage == 0:
+            yaw_error = wrap_to_pi(float(self.grasp_yaw) - float(self.base_yaw))
+            if abs(yaw_error) > 0.025:
+                self.set_twist(0.0, float(np.clip(1.4 * yaw_error, -0.22, 0.22)))
+                if self.now() - self.last_wait_log > 0.8:
+                    self.get_logger().info(
+                        f"[dual_hug] squaring chassis before symmetric IK: "
+                        f"yaw_error={yaw_error:.3f} rad"
+                    )
+                    self.last_wait_log = self.now()
+                return
+
+        if not self.target_locked:
+            elapsed = self.now() - self.state_t0
+            locked = elapsed >= DETECT_DWELL and self._lock_target()
+            if not locked and elapsed > DIRECT_TASK_DETECT_TIMEOUT:
+                locked = (
+                    self.lock_direct_task_geometry_fallback()
+                    or self.lock_inventory_geometry_fallback()
+                )
+            if not locked:
+                if elapsed > DETECT_TIMEOUT:
+                    self.fail_current_execution(
+                        "dual-arm tissue pickup could not lock target geometry"
+                    )
+                return
+
+        if stage == 0:
+            lateral = float(self.grasp_profile.get("dual_hug_pre_lateral", 0.150))
+            retract = float(self.grasp_profile.get("dual_hug_pre_retract", 0.180))
+            use_gateway = bool(self.grasp_profile.get("dual_hug_gateway", False))
+            if not self.arms_to_dual_hug(
+                lateral,
+                pull_distance=retract,
+                continuous=not use_gateway,
+                gateway_rotation=use_gateway,
+                z_offset_override=(
+                    self.grasp_profile.get("dual_hug_gateway_z_offset", 0.130)
+                    if use_gateway
+                    else None
+                ),
+            ):
+                self.fail_current_execution("dual-arm tissue pre-hug IK failed")
+                return
+            self.place_arm_slow = True
+            self.place_arm_slew = float(self.grasp_profile.get("deploy_arm_slew", 0.24))
+            self.dual_hug_stage = 1
+            self.dual_hug_gateway_done = not use_gateway
+            self.state_t0 = self.now()
+            self.get_logger().info(
+                f"[dual_hug] spreading both arms outside shelf: "
+                f"lateral=+/-{lateral:.3f} m retract={retract:.3f} m"
+            )
+            return
+
+        elapsed = self.now() - self.state_t0
+        joint_error = self.dual_hug_joint_error()
+        cart_error = self.dual_hug_cartesian_error()
+        if stage == 1:
+            path_complete = self.advance_dual_hug_joint_path()
+            if self.now() - float(getattr(self, "dual_hug_progress_log_at", 0.0)) > 2.0:
+                self.get_logger().info(
+                    "[dual_hug] outside-spread progress: "
+                    f"joint_err={joint_error:.3f} cart_err={cart_error:.3f} "
+                    f"slide_err={abs(float(self.slide_meas) - float(self.dual_hug_slide_target)):.3f}"
+                )
+                self.dual_hug_progress_log_at = self.now()
+            if (
+                path_complete
+                and cart_error < 0.050
+                and elapsed > 0.6
+                and not bool(getattr(self, "dual_hug_gateway_done", True))
+            ):
+                lateral = float(self.grasp_profile.get("dual_hug_pre_lateral", 0.150))
+                retract = float(self.grasp_profile.get("dual_hug_pre_retract", 0.180))
+                if not self.arms_to_dual_hug(lateral, pull_distance=retract):
+                    self.fail_current_execution("dual-arm tissue branch transition failed")
+                    return
+                self.dual_hug_gateway_done = True
+                self.state_t0 = self.now()
+                self.get_logger().info(
+                    "[dual_hug] gateway reached; changing wrist branch outside rack"
+                )
+                return
+            if (
+                path_complete
+                and cart_error < 0.050
+                and elapsed > 0.6
+                and bool(getattr(self, "dual_hug_gateway_done", True))
+            ):
+                lateral = float(self.grasp_profile.get("dual_hug_pre_lateral", 0.125))
+                if not self.arms_to_dual_hug(lateral, continuous=True):
+                    self.fail_current_execution("dual-arm tissue gap-insert IK failed")
+                    return
+                self.dual_hug_stage = 2
+                self.state_t0 = self.now()
+                self.get_logger().info(
+                    f"[dual_hug] inserting straight through both side gaps at "
+                    f"lateral=+/-{lateral:.3f} m"
+                )
+            elif elapsed > max(
+                30.0, float(getattr(self, "dual_hug_path_timeout", 30.0))
+            ):
+                self.fail_current_execution("dual-arm tissue outside spread did not settle")
+            return
+
+        if stage == 2:
+            path_complete = self.advance_dual_hug_joint_path()
+            if path_complete and cart_error < 0.050 and elapsed > 0.6:
+                lateral = float(self.grasp_profile.get("dual_hug_lateral", 0.080))
+                if not self.arms_to_dual_hug(lateral):
+                    self.fail_current_execution("dual-arm tissue squeeze IK failed")
+                    return
+                self.dual_hug_stage = 3
+                self.state_t0 = self.now()
+                self.get_logger().info(
+                    f"[dual_hug] symmetric squeeze to lateral=+/-{lateral:.3f} m"
+                )
+            elif elapsed > float(getattr(self, "dual_hug_path_timeout", 36.0)):
+                self.fail_current_execution("dual-arm tissue gap insert did not settle")
+            return
+
+        if stage == 3:
+            # Contact may deliberately leave a small joint following error.
+            # Hold the symmetric force for a bounded dwell before lifting.
+            if elapsed > 2.2:
+                lift = float(self.grasp_profile.get("dual_hug_lift", 0.080))
+                self.dual_hug_slide_target = max(
+                    -0.034, float(self.dual_hug_slide_target) - lift
+                )
+                self.tc[2] = self.dual_hug_slide_target
+                self.dual_hug_stage = 4
+                self.state_t0 = self.now()
+                self.get_logger().info(
+                    f"[dual_hug] squeeze established (joint_err={joint_error:.3f}); "
+                    f"lifting spine by {lift:.3f} m"
+                )
+            return
+
+        if stage == 4:
+            slide_error = abs(float(self.slide_meas) - float(self.dual_hug_slide_target))
+            if (slide_error < 0.018 and elapsed > 0.8) or elapsed > 5.0:
+                lateral = float(self.grasp_profile.get("dual_hug_lateral", 0.080))
+                pull = float(self.grasp_profile.get("dual_hug_pull_distance", 0.300))
+                if not self.arms_to_dual_hug(
+                    lateral, pull_distance=pull, lifted=True, continuous=True
+                ):
+                    self.fail_current_execution("dual-arm tissue pull IK failed")
+                    return
+                self.dual_hug_stage = 5
+                self.state_t0 = self.now()
+                self.get_logger().info(
+                    f"[dual_hug] extracting box {pull:.3f} m along shelf opening"
+                )
+            return
+
+        if stage == 5:
+            path_complete = self.advance_dual_hug_joint_path()
+            if (
+                path_complete
+                and (
+                    (cart_error < 0.060 and elapsed > 1.0)
+                    or elapsed > float(getattr(self, "dual_hug_path_timeout", 36.0))
+                )
+            ):
+                self.place_arm_slow = False
+                self.place_arm_slew = PLACE_ARM_SLEW
+                self.begin_delivery_after_grasp(
+                    "bounded public-sensor dual-arm hug/lift/pull sequence completed"
+                )
+            return
+
+    def advance_deploy_joint_path(
+        self, tolerance=CARTESIAN_DEPLOY_WAYPOINT_TOL, min_dwell=0.0
+    ):
+        """Stream a planned arm path only after the current waypoint settles.
+
+        ``rarm_meas`` alone is insufficient under load: the ROS executor can
+        briefly deliver a newer command-side sample while MuJoCo's high-
+        friction arm is still tracking an older waypoint.  Also gate on the
+        locally published smooth command and dwell at each point so actuator
+        dynamics cannot cut a Cartesian corner into a shelf object.
+        """
+        if not self.deploy_joint_path:
+            return True
+        current_error = float(np.max(np.abs(self.rarm_meas - self.tc[12:18])))
+        sent_error = float(np.max(np.abs(self.action[12:18] - self.tc[12:18])))
+        sent_tolerance = min(float(tolerance), 0.015)
+        if current_error > float(tolerance) or sent_error > sent_tolerance:
+            self.deploy_joint_waypoint_since = None
+            return False
+        now = self.now()
+        settled_since = getattr(self, "deploy_joint_waypoint_since", None)
+        if settled_since is None:
+            self.deploy_joint_waypoint_since = now
+            return False
+        if now - float(settled_since) < float(min_dwell):
+            return False
+        next_index = self.deploy_joint_path_index + 1
+        if next_index >= len(self.deploy_joint_path):
+            return True
+        self.deploy_joint_path_index = next_index
+        self.tc[12:18] = self.deploy_joint_path[next_index]
+        self.deploy_joint_waypoint_since = None
+        self.arm_target_set = True
+        return False
+
     def ee_footprint_pose(self):
         """Actual gripper endpoint pose in footprint via measured joints."""
         _, T = self.kdl.forward_kinematics(np.concatenate([[float(self.slide_meas)], self.rarm_meas]), index="right")
         return T
+
+    def right_arm_link_origins_footprint(self, arm_joints, slide):
+        """Return DH joint-frame origins in the robot footprint frame."""
+        transform = (
+            self.kdl.spine.get_transformation_matrix(float(slide))
+            @ self.kdl.spine2arm.get_transformation_matrix("right")
+        )
+        origins = []
+        for index, joint in enumerate(np.asarray(arm_joints, dtype=float), start=1):
+            transform = transform @ self.kdl.right_arm.dh.adjacent_transform(
+                float(joint), index
+            )
+            origins.append(transform[:3, 3].copy())
+        return tuple(origins)
 
     def ee_world(self):
         """Actual gripper endpoint in world via MMK2Kdl forward kinematics (measured joints)."""
@@ -3411,6 +4689,8 @@ class PickPlaceClient(Node):
         """Freeze the measured loaded-arm pose immediately after referee S3."""
         hold = self.action[2:19].copy()
         hold[0] = float(self.slide_meas)
+        hold[3:9] = self.larm_meas.copy()
+        hold[9] = float(self.lgripper_meas)
         hold[10:16] = self.rarm_meas.copy()
         hold[16] = float(self.grasp_profile.get("grip_close_target", GRIP_CLOSE))
         self.loaded_carry_hold = hold
@@ -3642,11 +4922,21 @@ class PickPlaceClient(Node):
                 f"{np.round(np.asarray(route), 2).tolist()}")
             return route
         if purpose == "shelf" and (self.front_blocked or self.nav_recovery_count > 0):
-            # Shelf recovery must stay deterministic.  The arena layout has a
-            # long divider and movable boxes near the shelf mouth; A* can
-            # occasionally find a "shorter" diagonal that is actually a bad
-            # geometry for the loaded arm.  Use the staged corridor only.
-            route = self.shelf_corridor_route(goal)
+            # A fixed corridor cannot avoid a randomized box that happens to
+            # occupy that corridor.  Once public sensors have proved a block,
+            # replan around the remembered LaserScan/RGB-D points.  Retain the
+            # staged route only as a fail-safe when the dynamic grid is
+            # temporarily over-constrained by dense/noisy returns.
+            dynamic = (
+                self.navigation_obstacle_points(max_range=5.0)
+                if self.enable_obstacle_avoidance
+                else []
+            )
+            route = self.planner.plan(self.base_xy, goal, dynamic)
+            planner_name = "shelf recovery A*"
+            if not route:
+                route = self.shelf_corridor_route(goal)
+                planner_name = "shelf recovery corridor fallback"
             self.nav_idx = 0
             self.nav_mode = "turn"
             self.route_needs_plan = False
@@ -3654,7 +4944,7 @@ class PickPlaceClient(Node):
             self.front_blocked_since = None
             self.last_replan_time = self.now()
             self.get_logger().info(
-                f"[planner] shelf recovery corridor with {len(route)} waypoints: "
+                f"[planner] {planner_name} with {len(route)} waypoints: "
                 f"{np.round(np.asarray(route), 2).tolist()}")
             return route
         if purpose == "grasp-retry":
@@ -4368,19 +5658,6 @@ class PickPlaceClient(Node):
         now = self.now()
         dist_to_target = float(np.linalg.norm(np.array(target, dtype=float) - np.array(self.base_xy, dtype=float)))
         if self.phase == NAV_SHELF:
-            # The shelf approach intentionally uses a long lateral transfer on
-            # the upper corridor before the final in-front-of-shelf alignment.
-            # Treat that motion as normal progress even if odom advances slowly;
-            # otherwise the controller reverses and replans while it is still
-            # trying to face the shelf mouth.
-            if (
-                abs(float(target[1]) - float(self.base_xy[1])) < 0.20
-                and float(self.base_xy[1]) >= SHELF_CROSS_Y - 0.15
-                and dist_to_target > 0.45
-            ):
-                self.last_nav_progress_xy = np.array(self.base_xy, dtype=float)
-                self.last_nav_progress_time = now
-                return False
             if (
                 self.nav_idx == 0
                 and target[1] <= START_EXIT_Y + 0.05
@@ -4414,10 +5691,18 @@ class PickPlaceClient(Node):
             self.last_nav_progress_time = now
             self.last_nav_dist_to_target = dist_to_target
             return False
+        # Start an absolute budget as soon as this drive segment is observed.
+        # The old implementation only armed it after a no-motion interval, so
+        # centimetre-scale collision jitter could reset the progress check
+        # forever and the advertised 90 s ceiling never actually existed.
+        waypoint_deadline = float(getattr(self, "_nav_waypoint_deadline", 0.0))
+        if waypoint_deadline == 0.0:
+            waypoint_deadline = now + STUCK_WAYPOINT_TIMEOUT
+            self._nav_waypoint_deadline = waypoint_deadline
         if now - self.last_nav_progress_time < STUCK_CHECK_INTERVAL:
             return False
         moved = float(np.linalg.norm(np.array(self.base_xy, dtype=float) - self.last_nav_progress_xy))
-        if moved >= STUCK_MIN_PROGRESS:
+        if moved >= STUCK_MIN_PROGRESS and now <= waypoint_deadline:
             # The base moved enough - reset the progress bar.  A waypoint that
             # still has not been reached after a very long time, even though
             # the base keeps moving (slow orbit / creep around a block, v62
@@ -4429,12 +5714,9 @@ class PickPlaceClient(Node):
         # Absolute time cap on a single waypoint: even with sub-threshold
         # motion, spending WAY more than any legit approach on one waypoint
         # means something is pinning us (a box orbit, a stuck corner).
-        # Normal shelf legs take 10-40 s; 90 s is a generous ceiling that a
-        # healthy run never touches, while it bounds the v62 415 s stall.
-        waypoint_deadline = float(getattr(self, "_nav_waypoint_deadline", 0.0))
-        if waypoint_deadline == 0.0:
-            self._nav_waypoint_deadline = now + STUCK_WAYPOINT_TIMEOUT
-        elif now > self._nav_waypoint_deadline:
+        # Normal shelf legs complete well inside this ceiling.  Enforce it
+        # even when collision jitter technically counts as odometry motion.
+        if now > waypoint_deadline:
             self.get_logger().warn(
                 f"[nav_recovery] waypoint not reached in "
                 f"{STUCK_WAYPOINT_TIMEOUT:.0f}s; recovery "
@@ -5255,10 +6537,16 @@ class PickPlaceClient(Node):
         slide_err = abs(self.slide_meas - self.tc[2])
         joint_err = np.max(np.abs(self.rarm_meas - self.tc[12:18])) if self.arm_target_set else float("inf")
         cart_err = float("inf")
+        lateral_err = float("inf")
         rot_err = float("inf")
         if self.DEPLOY_WORLD is not None:
             T = self.ee_footprint_pose()
-            cart_err = float(np.linalg.norm(self.footprint_to_world(T[:3, 3]) - self.DEPLOY_WORLD))
+            measured_world = self.footprint_to_world(T[:3, 3])
+            cart_err = float(np.linalg.norm(measured_world - self.DEPLOY_WORLD))
+            deploy_error_fp = self.world_to_footprint(measured_world) - self.world_to_footprint(
+                self.DEPLOY_WORLD
+            )
+            lateral_err = abs(float(deploy_error_fp[1]))
             rot_delta = T[:3, :3].T @ self.grasp_rot
             cos_angle = np.clip((np.trace(rot_delta) - 1.0) * 0.5, -1.0, 1.0)
             rot_err = float(math.acos(cos_angle))
@@ -5269,12 +6557,14 @@ class PickPlaceClient(Node):
             slide_err < 0.025
             and joint_err < DEPLOY_JOINT_TOL
             and cart_err < DEPLOY_CART_TOL
+            and lateral_err < DEPLOY_LATERAL_TOL
             and rot_err < DEPLOY_ROT_TOL
         )
         if not ready and self.now() - self.last_deploy_wait_log > 1.0:
             self.get_logger().info(
                 f"[deploy] waiting: slide_err={slide_err:.3f} "
-                f"joint_err={joint_err:.3f} cart_err={cart_err:.3f} rot_err={rot_err:.3f}")
+                f"joint_err={joint_err:.3f} cart_err={cart_err:.3f} "
+                f"lateral_err={lateral_err:.3f} rot_err={rot_err:.3f}")
             self.last_deploy_wait_log = self.now()
         return ready
 
@@ -5315,6 +6605,25 @@ class PickPlaceClient(Node):
         if self.grasp_was_confirmed and self.loaded_carry_hold is not None and self.phase != PLACE:
             self.hold_loaded_carry_pose(hold_slide=not self.place_pre_raise_active, hold_gripper=True, hold_right_arm=not self.loaded_arm_moving)
 
+        if self.phase == DEPLOY and self.tissue_side_pinch_enabled():
+            self.tick_tissue_side_pinch()
+            self.ramp_twist()
+            self.smooth_step()
+            self.publish()
+            return
+        if self.phase == DEPLOY and self.dual_arm_hug_enabled():
+            self.tick_dual_arm_hug()
+            self.ramp_twist()
+            self.smooth_step()
+            self.publish()
+            return
+        if self.phase == DEPLOY and self.tissue_top_pinch_enabled():
+            self.tick_tissue_top_pinch()
+            self.ramp_twist()
+            self.smooth_step()
+            self.publish()
+            return
+
         if self.phase == NAV_SHELF:
             if self.startup_clearance_step():
                 # The start-pocket gate owns the chassis until it has left the
@@ -5340,6 +6649,8 @@ class PickPlaceClient(Node):
                     self.reset_nav()
             elif self.follow_route(self.route_to_shelf, self.grasp_yaw):
                 self.phase, self.deploy_set = DEPLOY, False
+                self.deploy_joint_path = []
+                self.deploy_joint_path_index = 0
                 self.det_buf.clear()
                 self.target_locked = False
                 self.OBJECT_WORLD = None
@@ -5411,6 +6722,12 @@ class PickPlaceClient(Node):
                 elif self._lock_target():
                     if self.arm_to_reachable_deploy(self.DEPLOY_WORLD, rot=self.grasp_rot):
                         self.deploy_set = True
+                        deploy_slew = self.grasp_profile.get("deploy_arm_slew")
+                        if deploy_slew is not None:
+                            self.place_arm_slew = float(deploy_slew)
+                            self.place_arm_slow = True
+                        self._deploy_base_xy = np.asarray(self.base_xy, dtype=float).copy()
+                        self._deploy_base_yaw = float(self.base_yaw)
                         self.state_t0 = self.now()
                     else:
                         # A top-clamp pose that is outside IK reach cannot be
@@ -5476,6 +6793,12 @@ class PickPlaceClient(Node):
                                 self.DEPLOY_WORLD, rot=self.grasp_rot
                             ):
                                 self.deploy_set = True
+                                deploy_slew = self.grasp_profile.get("deploy_arm_slew")
+                                if deploy_slew is not None:
+                                    self.place_arm_slew = float(deploy_slew)
+                                    self.place_arm_slow = True
+                                self._deploy_base_xy = np.asarray(self.base_xy, dtype=float).copy()
+                                self._deploy_base_yaw = float(self.base_yaw)
                                 self.state_t0 = self.now()
                             else:
                                 self.target_locked = False
@@ -5490,7 +6813,36 @@ class PickPlaceClient(Node):
                         else:
                             self.retry_local_grasp("vision target timeout during deploy")
             if self.deploy_set:
-                if self.deploy_done():
+                deploy_base_xy = getattr(self, "_deploy_base_xy", None)
+                deploy_base_yaw = getattr(self, "_deploy_base_yaw", None)
+                base_shift = (
+                    float(np.linalg.norm(
+                        np.asarray(self.base_xy, dtype=float) - deploy_base_xy
+                    ))
+                    if deploy_base_xy is not None
+                    else 0.0
+                )
+                yaw_shift = (
+                    abs(wrap_to_pi(float(self.base_yaw) - float(deploy_base_yaw)))
+                    if deploy_base_yaw is not None
+                    else 0.0
+                )
+                if (
+                    base_shift > DEPLOY_COLLISION_BASE_SHIFT
+                    or yaw_shift > DEPLOY_COLLISION_YAW_SHIFT
+                ):
+                    self.get_logger().warn(
+                        "[deploy_guard] arm deployment disturbed the chassis; "
+                        f"shift={base_shift:.3f}m yaw={yaw_shift:.3f}rad"
+                    )
+                    self.retry_local_grasp(
+                        "arm deployment disturbed chassis before contact"
+                    )
+                    return
+                path_complete = self.advance_deploy_joint_path()
+                if path_complete and self.deploy_done():
+                    self.place_arm_slow = False
+                    self.place_arm_slew = PLACE_ARM_SLEW
                     self.phase = CREEP
                     self.creep_started_at = self.now()
                     # Round 56 experiment (freeze grasp_yaw instead of
@@ -5505,15 +6857,21 @@ class PickPlaceClient(Node):
                     self.creep_heading_lock = float(self.base_yaw)
                     self.creep_timeout_recovery_until = 0.0
                     self.creep_timeout_recovery_used = False
-                elif self.now() - self.state_t0 > DEPLOY_TIMEOUT:
+                    self.creep_arm_extension_active = False
+                    self.creep_arm_extension_base_xy = None
+                    self.creep_arm_extension_base_yaw = None
+                elif self.now() - self.state_t0 > float(
+                    self.grasp_profile.get("deploy_timeout", DEPLOY_TIMEOUT)
+                ):
                     # A collision can leave the arm controller reporting a
-                    # nearly settled joint state while the physical endpoint
-                    # remains far from its requested pre-grasp pose. Retire
-                    # this untouched slot instead of driving the chassis into
-                    # the rack and then closing in empty space.
-                    self.fail_current_execution(
-                        "grasp failed at shelf: deploy pose did not reach measured Cartesian target; "
-                        "skip this item"
+                    # nearly settled joint state while the world-frame endpoint
+                    # remains far from its requested pre-grasp pose.  No object
+                    # contact has occurred in DEPLOY, so first stow and re-lock
+                    # from the current base pose.  retry_local_grasp() applies
+                    # the bounded retry budget and eventually fails closed if
+                    # the pose remains unreachable.
+                    self.retry_local_grasp(
+                        "deploy pose did not reach measured Cartesian target"
                     )
                     return
         elif self.phase == CREEP:
@@ -5533,6 +6891,45 @@ class PickPlaceClient(Node):
             # Stop along the two-finger centreline, not at a world-Y proxy.
             remaining = float(np.dot(endpoint_error, grasp_fwd))
             lateral_error = float(np.dot(endpoint_error, grasp_left))
+            if getattr(self, "creep_arm_extension_active", False):
+                extension_base_xy = getattr(self, "creep_arm_extension_base_xy", None)
+                extension_base_yaw = getattr(self, "creep_arm_extension_base_yaw", None)
+                base_shift = (
+                    float(np.linalg.norm(
+                        np.asarray(self.base_xy, dtype=float) - extension_base_xy
+                    ))
+                    if extension_base_xy is not None
+                    else 0.0
+                )
+                yaw_shift = (
+                    abs(wrap_to_pi(float(self.base_yaw) - float(extension_base_yaw)))
+                    if extension_base_yaw is not None
+                    else 0.0
+                )
+                if (
+                    base_shift > DEPLOY_COLLISION_BASE_SHIFT
+                    or yaw_shift > DEPLOY_COLLISION_YAW_SHIFT
+                ):
+                    self.creep_arm_extension_active = False
+                    self.place_arm_slow = False
+                    self.retry_local_grasp(
+                        "bounded creep arm extension disturbed chassis before close"
+                    )
+                    return
+                self.set_twist(0.0, 0.0)
+                if not self.action_done(dwell=0.35):
+                    self.ramp_twist()
+                    self.smooth_step()
+                    self.publish()
+                    return
+                self.creep_arm_extension_active = False
+                self.place_arm_slow = False
+                self.place_arm_slew = PLACE_ARM_SLEW
+                self.creep_started_at = self.now()
+                self.get_logger().info(
+                    f"[creep] bounded arm extension settled: "
+                    f"remaining={remaining:.3f} m lateral={lateral_error:.3f} m"
+                )
             creep_timeout = float(self.grasp_profile.get("creep_timeout", CREEP_TIMEOUT))
             timed_out = self.creep_started_at is not None and self.now() - self.creep_started_at > creep_timeout
             timeout_recovery_active = self.creep_timeout_recovery_until > self.now()
@@ -5593,6 +6990,53 @@ class PickPlaceClient(Node):
                 remaining <= visual_close_remaining
                 and abs(lateral_error) <= visual_close_lateral
             )
+            arm_extension = float(self.grasp_profile.get(
+                "creep_timeout_arm_extension", 0.0
+            ))
+            if (
+                timed_out
+                and not self.creep_timeout_recovery_used
+                and arm_extension > 0.0
+                and remaining > float(geometry_close_remaining or close_tol)
+                and remaining <= float(self.grasp_profile.get(
+                    "creep_timeout_arm_extension_max_remaining", 0.0
+                ))
+                and abs(lateral_error) <= float(self.grasp_profile.get(
+                    "creep_timeout_arm_extension_lateral", 0.0
+                ))
+                and not target_touched
+            ):
+                advance = min(
+                    arm_extension,
+                    max(0.0, remaining - float(geometry_close_remaining or close_tol)),
+                )
+                extension_world = np.asarray(ee, dtype=float) + grasp_fwd * advance
+                self.place_arm_slow = True
+                self.place_arm_slew = float(self.grasp_profile.get(
+                    "creep_timeout_arm_slew", 0.25
+                ))
+                self.creep_timeout_recovery_used = True
+                if self.arm_to(extension_world, rot=self.grasp_rot):
+                    self.creep_arm_extension_active = True
+                    self.creep_arm_extension_base_xy = np.asarray(
+                        self.base_xy, dtype=float
+                    ).copy()
+                    self.creep_arm_extension_base_yaw = float(self.base_yaw)
+                    self.state_t0 = self.now()
+                    self.set_twist(0.0, 0.0)
+                    self.get_logger().warn(
+                        f"[creep] chassis reached shelf; commanding one bounded "
+                        f"arm extension={advance:.3f} m from remaining={remaining:.3f} m"
+                    )
+                    self.ramp_twist()
+                    self.smooth_step()
+                    self.publish()
+                    return
+                self.place_arm_slow = False
+                self.place_arm_slew = PLACE_ARM_SLEW
+                self.get_logger().warn(
+                    f"[creep] bounded arm extension IK failed at remaining={remaining:.3f} m"
+                )
             if (
                 not timeout_recovery_active
                 and not self.creep_timeout_recovery_used
@@ -5656,10 +7100,15 @@ class PickPlaceClient(Node):
                 # the referee can fire while the fingers are still ~8 cm short
                 # (visual11: touched at remaining=0.085 -> empty close).  Only
                 # close when the visual remaining is genuinely small.
-                if remaining > 0.030:
-                    self.get_logger().info(
-                        f"[creep] touched but still {remaining:.3f} m out; "
-                        f"continuing to creep before closing")
+                touch_final_close_remaining = float(self.grasp_profile.get(
+                    "touch_final_close_remaining", 0.030
+                ))
+                if remaining > touch_final_close_remaining:
+                    # The rate-limited slow-centering diagnostic below already
+                    # reports this condition.  Avoid one log line per 50-Hz
+                    # control tick, which hid useful state transitions in long
+                    # competition logs.
+                    pass
                 else:
                     self.set_twist(0.0, 0.0)
                     self.get_logger().info(

@@ -1,0 +1,21 @@
+{
+  "model_version": "1.0.0",
+  "base_code_commit": "b3641cf",
+  "classes": [
+    "sanmingzhi",
+    "heweidao",
+    "shupian",
+    "zhijin",
+    "maidong",
+    "kele",
+    "kouxiangtang",
+    "pingguo",
+    "chengzi"
+  ],
+  "training_layout_seeds": [],
+  "validation_layout_seeds": [],
+  "test_layout_seeds": [],
+  "training_data_manifest_status": "pending_team_input",
+  "imgsz": 640,
+  "sha256": "5763801f2875491ab8b00c61fd1ed539de221ae3d2712cf93ad2464529365daf"
+}

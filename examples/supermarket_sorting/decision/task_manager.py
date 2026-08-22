@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import statistics
 import time
 from collections import Counter
 from pathlib import Path
@@ -42,6 +43,13 @@ INVENTORY_SLOT_X_TOL = float(os.getenv("SUPERMARKET_INVENTORY_SLOT_X_TOL", "0.28
 INVENTORY_SLOT_Y_TOL = float(os.getenv("SUPERMARKET_INVENTORY_SLOT_Y_TOL", "0.30"))
 INVENTORY_SLOT_X_BLEND_LIMIT = float(os.getenv("SUPERMARKET_INVENTORY_SLOT_X_BLEND_LIMIT", "0.045"))
 INVENTORY_SLOT_Y_BLEND_LIMIT = float(os.getenv("SUPERMARKET_INVENTORY_SLOT_Y_BLEND_LIMIT", "0.080"))
+# The fixed marker is 75 mm in front of the nominal product-centre plane in
+# the official shelf model.  Product and marker are measured in the same RGB-D
+# frame, so their relative Y cancels a short odom/camera timestamp skew.
+MARKER_TO_SLOT_CENTER_Y = float(os.getenv("SUPERMARKET_MARKER_TO_SLOT_CENTER_Y", "0.075"))
+MARKER_DEPTH_ANCHOR_MAX_CORRECTION = float(os.getenv(
+    "SUPERMARKET_MARKER_DEPTH_ANCHOR_MAX_CORRECTION", "0.12"
+))
 INVENTORY_MAX_AGE_SEC = max(
     0.001, float(os.getenv("SUPERMARKET_INVENTORY_MAX_AGE_SEC", "12.0"))
 )
@@ -53,6 +61,25 @@ INVENTORY_MAX_AGE_SEC = max(
 # and forced a full rescan of the whole shelf.
 INVENTORY_POSE_MAX_AGE_SEC = max(
     0.001, float(os.getenv("SUPERMARKET_INVENTORY_POSE_MAX_AGE_SEC", "12.0"))
+)
+FRESH_GRASP_MAX_AGE_SEC = max(
+    0.05, float(os.getenv("SUPERMARKET_FRESH_GRASP_MAX_AGE_SEC", "0.5"))
+)
+FRESH_GRASP_MIN_SAMPLES = max(
+    2, int(os.getenv("SUPERMARKET_FRESH_GRASP_MIN_SAMPLES", "3"))
+)
+FRESH_GRASP_MAX_STD_M = max(
+    0.001, float(os.getenv("SUPERMARKET_FRESH_GRASP_MAX_STD_M", "0.02"))
+)
+FRESH_GRASP_MAX_FRAME_GAP_SEC = max(
+    0.01, float(os.getenv("SUPERMARKET_FRESH_GRASP_MAX_FRAME_GAP_SEC", "0.35"))
+)
+INVENTORY_ASSOC_MAX_SCORE = max(
+    0.0, float(os.getenv("SUPERMARKET_ASSOC_MAX_SCORE", "1.5"))
+)
+INVENTORY_POSE_HISTORY_SIZE = max(
+    FRESH_GRASP_MIN_SAMPLES,
+    int(os.getenv("SUPERMARKET_INVENTORY_POSE_HISTORY_SIZE", "12")),
 )
 INVENTORY_IDENTITY_MAX_AGE_SEC = max(
     0.001, float(os.getenv("SUPERMARKET_INVENTORY_IDENTITY_MAX_AGE_SEC", "3600.0"))
@@ -180,6 +207,75 @@ class TaskManager:
             float(target_z),
         )
 
+    def _anchor_observation_depth_to_marker(
+        self,
+        *,
+        aruco_id: int,
+        observed_world: tuple[float, float, float],
+        marker_world: tuple[float, float, float] | None,
+    ) -> tuple[float, float, float]:
+        """Cancel same-frame world-Y transform error with the fixed tag.
+
+        This uses no randomized object truth: ArUco ids and their shelf slots
+        are the official fixed map.  Only the shelf-normal coordinate is
+        corrected; the detector retains the product's measured lateral offset
+        and TaskManager separately fuses its known level/height for Z.
+        """
+        if marker_world is None:
+            return observed_world
+        slot = self.slot_by_aruco.get(int(aruco_id))
+        if slot is None:
+            return observed_world
+        try:
+            slot_y = float(slot["world_position"][1])
+            marker_y = float(marker_world[1])
+        except (KeyError, IndexError, TypeError, ValueError):
+            return observed_world
+        nominal_marker_y = slot_y - MARKER_TO_SLOT_CENTER_Y
+        correction_y = nominal_marker_y - marker_y
+        if not math.isfinite(correction_y) or abs(correction_y) > MARKER_DEPTH_ANCHOR_MAX_CORRECTION:
+            return observed_world
+        return (
+            float(observed_world[0]),
+            float(observed_world[1] + correction_y),
+            float(observed_world[2]),
+        )
+
+    def anchor_grasp_center_depth_to_marker(
+        self,
+        *,
+        aruco_id: int,
+        center_world: tuple[float, float, float],
+        marker_world: tuple[float, float, float] | None,
+    ) -> tuple[float, float, float]:
+        """Recover the package centre plane from its same-frame fixed tag.
+
+        The detector point is a visible package surface and may collapse onto
+        the tag plane after the arm partly occludes the box. In the official
+        shelf model the fixed tag is 75 mm in front of the nominal package
+        centre plane. Preserve measured X/Z, and use that relation only when
+        the correction is small enough to be physically plausible.
+        """
+        if marker_world is None or int(aruco_id) not in self.slot_by_aruco:
+            return center_world
+        try:
+            marker_y = float(marker_world[1])
+            measured_y = float(center_world[1])
+        except (IndexError, TypeError, ValueError):
+            return center_world
+        anchored_y = marker_y + MARKER_TO_SLOT_CENTER_Y
+        if (
+            not math.isfinite(anchored_y)
+            or not math.isfinite(measured_y)
+            or abs(anchored_y - measured_y) > MARKER_DEPTH_ANCHOR_MAX_CORRECTION
+        ):
+            return center_world
+        return (
+            float(center_world[0]),
+            float(anchored_y),
+            float(center_world[2]),
+        )
+
     def register_inventory_observations(self, observations: Iterable[dict]) -> int:
         """Store stable RGB-D observations keyed by their visible ArUco ID.
 
@@ -200,7 +296,20 @@ class TaskManager:
                 confidence = float(observation.get("confidence", 0.0))
             except (KeyError, TypeError, ValueError):
                 continue
-            world = self._valid_observation_world(observation.get("world"))
+            if bool(observation.get("ambiguous", False)):
+                continue
+            if str(observation.get("reject_reason", "ok")) != "ok":
+                continue
+            try:
+                association_score = float(observation.get("association_score", 0.0))
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(association_score) or association_score > INVENTORY_ASSOC_MAX_SCORE:
+                continue
+            world = self._valid_observation_world(
+                observation.get("object_world", observation.get("world"))
+            )
+            marker_world = self._valid_observation_world(observation.get("marker_world"))
             if (
                 not 0 <= aruco_id < 45
                 or not kind
@@ -208,6 +317,11 @@ class TaskManager:
                 or world is None
             ):
                 continue
+            world = self._anchor_observation_depth_to_marker(
+                aruco_id=aruco_id,
+                observed_world=world,
+                marker_world=marker_world,
+            )
             world = self._inventory_world_for_slot(
                 aruco_id=aruco_id,
                 kind=kind,
@@ -215,8 +329,7 @@ class TaskManager:
             )
             if world is None:
                 continue
-            marker_world = self._valid_observation_world(observation.get("marker_world"))
-            stamp = observation.get("stamp")
+            stamp = observation.get("frame_stamp", observation.get("stamp"))
             try:
                 stamp = float(stamp)
             except (TypeError, ValueError):
@@ -234,7 +347,7 @@ class TaskManager:
                 if last_stamp is not None and abs(float(last_stamp) - stamp) < 1e-6:
                     continue
             if previous is None:
-                self.inventory_by_aruco[aruco_id] = {
+                record = {
                     "kind": kind,
                     "confidence": confidence,
                     "world": world,
@@ -249,6 +362,15 @@ class TaskManager:
                     "pose_seen_at": fresh_at,
                     "last_stamp": stamp,
                 }
+                self._append_pose_history(
+                    record,
+                    world=world,
+                    marker_world=marker_world,
+                    stamp=stamp,
+                    fresh_at=fresh_at,
+                    association_score=association_score,
+                )
+                self.inventory_by_aruco[aruco_id] = record
                 if INVENTORY_MIN_HITS == 1:
                     accepted += 1
                 continue
@@ -270,6 +392,14 @@ class TaskManager:
                     previous["fresh_at"] = fresh_at
                     previous["pose_seen_at"] = fresh_at
                     previous["last_stamp"] = stamp
+                    self._append_pose_history(
+                        previous,
+                        world=world,
+                        marker_world=marker_world,
+                        stamp=stamp,
+                        fresh_at=fresh_at,
+                        association_score=association_score,
+                    )
                 continue
 
             if previous.get("kind") != kind:
@@ -278,7 +408,7 @@ class TaskManager:
                 # collection for the newly observed class.
                 if previous.get("confirmed"):
                     continue
-                self.inventory_by_aruco[aruco_id] = {
+                record = {
                     "kind": kind,
                     "confidence": confidence,
                     "world": world,
@@ -293,6 +423,15 @@ class TaskManager:
                     "pose_seen_at": fresh_at,
                     "last_stamp": stamp,
                 }
+                self._append_pose_history(
+                    record,
+                    world=world,
+                    marker_world=marker_world,
+                    stamp=stamp,
+                    fresh_at=fresh_at,
+                    association_score=association_score,
+                )
+                self.inventory_by_aruco[aruco_id] = record
                 if INVENTORY_MIN_HITS == 1:
                     accepted += 1
                 continue
@@ -312,6 +451,15 @@ class TaskManager:
                     previous["last_seen"] = stamp if stamp is not None else now
                     previous["fresh_at"] = fresh_at
                     previous["state"] = INVENTORY_STATE_OBSERVED
+                    previous["pose_history"] = []
+                    self._append_pose_history(
+                        previous,
+                        world=world,
+                        marker_world=marker_world,
+                        stamp=stamp,
+                        fresh_at=fresh_at,
+                        association_score=association_score,
+                    )
                     continue
 
             was_confirmed = bool(previous.get("confirmed"))
@@ -332,10 +480,128 @@ class TaskManager:
             previous["fresh_at"] = fresh_at
             previous["pose_seen_at"] = fresh_at
             previous["last_stamp"] = stamp
+            self._append_pose_history(
+                previous,
+                world=world,
+                marker_world=marker_world,
+                stamp=stamp,
+                fresh_at=fresh_at,
+                association_score=association_score,
+            )
             if previous["confirmed"] and not was_confirmed:
                 previous["identity_seen_at"] = fresh_at
                 accepted += 1
         return accepted
+
+    @staticmethod
+    def _append_pose_history(
+        record: dict,
+        *,
+        world: tuple[float, float, float],
+        marker_world: tuple[float, float, float] | None,
+        stamp: float | None,
+        fresh_at: float,
+        association_score: float,
+    ) -> None:
+        history = record.setdefault("pose_history", [])
+        history.append({
+            "world": tuple(float(value) for value in world),
+            "marker_world": marker_world,
+            "stamp": stamp,
+            "fresh_at": float(fresh_at),
+            "association_score": float(association_score),
+        })
+        if len(history) > INVENTORY_POSE_HISTORY_SIZE:
+            del history[:-INVENTORY_POSE_HISTORY_SIZE]
+
+    def fresh_grasp_observation(
+        self,
+        task: PickTask,
+        *,
+        now: float | None = None,
+    ) -> dict | None:
+        """Return a stable, current-frame ArUco-bound grasp observation.
+
+        Historical inventory identity is intentionally insufficient here.
+        The returned pose needs multiple recent, unambiguous observations for
+        the *active* ArUco id and product class with centimetre-scale stability.
+        """
+        record = self.inventory_by_aruco.get(int(task.aruco_id))
+        if (
+            record is None
+            or not record.get("confirmed")
+            or str(record.get("kind", "")) != str(task.product_name)
+            or record.get("state") in {INVENTORY_STATE_CONSUMED, INVENTORY_STATE_DISTURBED}
+        ):
+            return None
+        now = time.time() if now is None else float(now)
+        recent = [
+            sample for sample in record.get("pose_history", [])
+            if 0.0 <= now - float(sample.get("fresh_at", -1e9)) <= FRESH_GRASP_MAX_AGE_SEC
+            and float(sample.get("association_score", float("inf"))) <= INVENTORY_ASSOC_MAX_SCORE
+        ]
+        if len(recent) < FRESH_GRASP_MIN_SAMPLES:
+            return None
+        # A duplicated/re-published camera frame must never satisfy the
+        # consecutive-frame requirement.
+        unique: list[dict] = []
+        seen_stamps: set[float] = set()
+        for sample in recent:
+            stamp = sample.get("stamp")
+            if stamp is not None:
+                key = round(float(stamp), 6)
+                if key in seen_stamps:
+                    continue
+                seen_stamps.add(key)
+            unique.append(sample)
+        if len(unique) < FRESH_GRASP_MIN_SAMPLES:
+            return None
+        unique = unique[-FRESH_GRASP_MIN_SAMPLES:]
+        arrivals = [float(sample["fresh_at"]) for sample in unique]
+        if any(
+            later - earlier > FRESH_GRASP_MAX_FRAME_GAP_SEC
+            for earlier, later in zip(arrivals, arrivals[1:])
+        ):
+            return None
+        axes = list(zip(*(sample["world"] for sample in unique)))
+        world = tuple(float(statistics.median(axis)) for axis in axes)
+        pose_std = tuple(
+            float(statistics.pstdev(axis)) if len(axis) > 1 else 0.0
+            for axis in axes
+        )
+        if max(pose_std) > FRESH_GRASP_MAX_STD_M:
+            return None
+        return {
+            "world": world,
+            "pose_std": pose_std,
+            "sample_count": len(unique),
+            "frame_stamps": [sample.get("stamp") for sample in unique],
+            "seen_at": max(arrivals),
+            "marker_world": unique[-1].get("marker_world"),
+            "association_score": max(
+                float(sample.get("association_score", 0.0)) for sample in unique
+            ),
+        }
+
+    def apply_fresh_grasp_observation(self, task: PickTask) -> bool:
+        """Update only the grasp pose; never move the frozen navigation goal."""
+        observation = self.fresh_grasp_observation(task)
+        if observation is None:
+            return False
+        world = tuple(float(value) for value in observation["world"])
+        task.world_position = world
+        task.fresh_grasp_world = world
+        task.fresh_grasp_seen_at = float(observation["seen_at"])
+        task.metadata.update({
+            "fresh_grasp_world": list(world),
+            "fresh_grasp_pose_std": list(observation["pose_std"]),
+            "fresh_grasp_sample_count": int(observation["sample_count"]),
+            "fresh_grasp_frame_stamps": observation["frame_stamps"],
+            "fresh_grasp_association_score": float(observation["association_score"]),
+            "fresh_grasp_marker_world": observation.get("marker_world"),
+            "fresh_grasp_seen_at": task.fresh_grasp_seen_at,
+        })
+        return True
 
     @staticmethod
     def _inventory_age(record: dict, now: float | None = None) -> float | None:
@@ -706,8 +972,23 @@ class TaskManager:
         if already_applied:
             return False
 
+        # Navigation depth comes from the fixed ArUco slot geometry.  RGB-D
+        # observes the package's front surface, so using that Y directly for
+        # parking leaves the chassis one product half-depth too far away.  X
+        # still uses the bounded visual correction and Z is already fused
+        # from slot level + product height above.
+        navigation_world = world
+        slot = self.slot_by_aruco.get(int(task.aruco_id))
+        if slot is not None:
+            try:
+                slot_world = tuple(float(value) for value in slot["world_position"])
+                navigation_world = (world[0], slot_world[1], world[2])
+            except (KeyError, TypeError, ValueError):
+                navigation_world = world
+
         task.product_name = product_name
-        task.world_position = world
+        task.world_position = navigation_world
+        task.navigation_world_position = navigation_world
         task.grasp_strategy = self._default_grasp_strategy(product_name, task.level)
         if task.grasp_strategy == "front_short_axis_box_clamp":
             standoff_y = (
@@ -719,10 +1000,10 @@ class TaskManager:
             standoff_y = SHELF_APPROACH_STANDOFF_Y
         task.navigation_target = NavigationTarget(
             frame_id="map",
-            x=world[0] - RIGHT_ARM_OBJECT_X_OFFSET,
+            x=navigation_world[0] - RIGHT_ARM_OBJECT_X_OFFSET,
             y=float(max(
                 SHELF_APPROACH_Y_MIN,
-                min(world[1] - standoff_y, SHELF_APPROACH_Y_MAX),
+                min(navigation_world[1] - standoff_y, SHELF_APPROACH_Y_MAX),
             )),
             yaw=APPROACH_YAW,
         )
@@ -730,7 +1011,9 @@ class TaskManager:
             "detected_kind": product_name,
             "inventory_confirmed": True,
             "inventory_hits": int(observation.get("hits", 0)),
-            "inventory_world": list(world),
+            "inventory_surface_world": list(world),
+            "inventory_world": list(navigation_world),
+            "navigation_world_position": list(navigation_world),
             "inventory_state": observation.get("state", INVENTORY_STATE_CONFIRMED),
         })
         return True
@@ -1050,6 +1333,20 @@ class TaskManager:
                 'y': task.world_position[1],
                 'z': task.world_position[2],
             },
+            'navigation_world_position': (
+                None if task.navigation_world_position is None else {
+                    'x': task.navigation_world_position[0],
+                    'y': task.navigation_world_position[1],
+                    'z': task.navigation_world_position[2],
+                }
+            ),
+            'fresh_grasp_world': (
+                None if task.fresh_grasp_world is None else {
+                    'x': task.fresh_grasp_world[0],
+                    'y': task.fresh_grasp_world[1],
+                    'z': task.fresh_grasp_world[2],
+                }
+            ),
         }
 
     def _decision_result(self, selected: PickTask | None, *, reason: str) -> DecisionResult:
@@ -1100,6 +1397,7 @@ class TaskManager:
                 'display_slot': slot_id,
                 'gs_ply': item.get('gs_ply'),
             },
+            navigation_world_position=tuple(float(v) for v in item['world_position']),
         )
 
     def _unique_slots(self) -> list[dict]:
@@ -1151,6 +1449,7 @@ class TaskManager:
                 'official_target_id': target_id,
                 'search_mode': True,
             },
+            navigation_world_position=tuple(float(v) for v in item['world_position']),
         )
 
     def _default_grasp_strategy(self, object_kind: str, level: str) -> str:

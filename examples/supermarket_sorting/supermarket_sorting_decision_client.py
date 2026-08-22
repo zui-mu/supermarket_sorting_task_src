@@ -27,7 +27,17 @@ from std_msgs.msg import String
 from decision.mission_metrics import MissionMetrics
 from decision.task_manager import TaskManager
 from manipulation.arm_capabilities import requires_mirrored_left_arm
-from supermarket_sorting_client import DEPLOY, DONE, NAV_SHELF, PHASE_NAME, PickPlaceClient
+from supermarket_sorting_client import (
+    DEPLOY,
+    DONE,
+    NAV_SHELF,
+    PHASE_NAME,
+    REACH_FWD_MAX,
+    REACH_FWD_MIN,
+    REACH_Z_MAX,
+    REACH_Z_MIN,
+    PickPlaceClient,
+)
 
 TASK_DIR = Path(__file__).resolve().parent
 RUNTIME_LAYOUT_JSON = TASK_DIR / "runtime_layout.json"
@@ -125,7 +135,10 @@ class DecisionPickPlaceClient(PickPlaceClient):
                 pass
             if accepted:
                 self.get_logger().info(f"[inventory] accepted {accepted} ArUco-bound observations")
-                self._refresh_active_task_from_inventory()
+            # A RESERVED record refreshes only the short-lived grasp pose and
+            # therefore does not increment ``accepted``.  Still run the
+            # active-task refresh path on every schema-v3 frame.
+            self._refresh_active_task_from_inventory()
         except Exception as exc:  # noqa: BLE001 - a malformed observation must not kill the node
             self.get_logger().warn(f"[inventory] observation handling failed: {exc}")
 
@@ -186,6 +199,111 @@ class DecisionPickPlaceClient(PickPlaceClient):
             % json.dumps(self.active_payload, ensure_ascii=False)
         )
         self._trace("inventory_pose_applied", self.active_payload)
+
+    def _fresh_grasp_platform_stable(self) -> bool:
+        """Require a parked chassis and settled head/slide before pose lock."""
+        if self.phase != DEPLOY or self.deploy_set:
+            return False
+        if abs(float(self.cur_lin)) > 0.01 or abs(float(self.cur_ang)) > 0.02:
+            return False
+        if abs(float(self.des_lin)) > 0.01 or abs(float(self.des_ang)) > 0.02:
+            return False
+        velocities = self.jvel or {}
+        for joint in ("slide_joint", "head_yaw_joint", "head_pitch_joint"):
+            try:
+                if abs(float(velocities.get(joint, 0.0))) > 0.03:
+                    return False
+            except (TypeError, ValueError):
+                return False
+        return True
+
+    def det_cb(self, msg) -> None:
+        """Do not let a bare Detection3D lock an anonymous official slot.
+
+        The generic topic has no ArUco id.  It remains useful as a heartbeat
+        and, after a strict lock, as a displacement monitor; the initial grasp
+        lock comes only from schema-v3 ArUco-bound observations.
+        """
+        if self.active_search_mode() and not self.target_locked:
+            self.detection_stream_seen_at = self.now()
+            return
+        super().det_cb(msg)
+
+    def _lock_target(self):
+        if not self.active_search_mode():
+            return super()._lock_target()
+        if self.active_task is None or self.active_product_name == "__search__":
+            return False
+        if not self._fresh_grasp_platform_stable():
+            return False
+        if not self.task_manager.apply_fresh_grasp_observation(self.active_task):
+            if self.now() - self.last_wait_log > 1.0:
+                self.get_logger().info(
+                    "[fresh_grasp] waiting for 3 current, stable frames bound to "
+                    f"ArUco {self.active_task.aruco_id} and {self.active_product_name}"
+                )
+                self.last_wait_log = self.now()
+            return False
+
+        surface_world = np.asarray(self.active_task.fresh_grasp_world, dtype=float)
+        # The schema-v3 RGB-D point is the visible package surface.  Reuse the
+        # per-product forward calibration used by the generic detection path,
+        # but keep Z from TaskManager: it has already fused the ArUco slot
+        # level with the product half-height and must not receive the legacy
+        # surface-to-centre Z correction a second time.
+        object_world = self._vision_to_object_center(surface_world)
+        object_world[2] = surface_world[2]
+        marker_world = self.active_task.metadata.get("fresh_grasp_marker_world")
+        anchored_world = self.task_manager.anchor_grasp_center_depth_to_marker(
+            aruco_id=self.active_task.aruco_id,
+            center_world=tuple(float(value) for value in object_world),
+            marker_world=(
+                tuple(float(value) for value in marker_world)
+                if marker_world is not None
+                else None
+            ),
+        )
+        object_world = np.asarray(anchored_world, dtype=float)
+        fp = self.world_to_footprint(object_world)
+        reach_lateral_max = float(self.grasp_profile.get("reach_lateral_max", 0.35))
+        if (
+            fp[0] < REACH_FWD_MIN
+            or fp[0] > REACH_FWD_MAX
+            or abs(float(fp[1])) > reach_lateral_max
+            or object_world[2] < REACH_Z_MIN
+            or object_world[2] > REACH_Z_MAX
+        ):
+            self.get_logger().warn(
+                "[fresh_grasp] current ArUco-bound pose is unreachable; "
+                f"world={np.round(object_world, 3)} fp={np.round(fp, 3)}"
+            )
+            return False
+        if not self._neighbor_clearance_ok(object_world):
+            return False
+
+        # Update only the grasp endpoint.  navigation_target and
+        # navigation_world_position remain frozen from the first inventory
+        # confirmation, so a late RGB-D correction cannot move the chassis.
+        self.expected_object_world = object_world.copy()
+        self.search_slot_world = object_world.copy()
+        self.active_task.world_position = tuple(float(value) for value in object_world)
+        self.active_task.fresh_grasp_world = self.active_task.world_position
+        self.active_task.metadata["fresh_grasp_surface_world"] = [
+            float(value) for value in surface_world
+        ]
+        self.active_task.metadata["fresh_grasp_world"] = [
+            float(value) for value in object_world
+        ]
+        self.active_payload = self.task_manager.build_execution_payload(self.active_task)
+        self.lock_grasp_geometry(object_world, source="aruco-v3")
+        self.get_logger().info(
+            "[fresh_grasp] locked active slot from schema v3: "
+            f"aruco={self.active_task.aruco_id} kind={self.active_product_name} "
+            f"world={np.round(object_world, 3)} "
+            f"std={self.active_task.metadata.get('fresh_grasp_pose_std')}"
+        )
+        self._trace("fresh_grasp_pose_locked", self.active_payload)
+        return True
 
     def _setup_decision_layer(self) -> None:
         order_spec = os.getenv('SUPERMARKET_ORDER', 'official').strip()
