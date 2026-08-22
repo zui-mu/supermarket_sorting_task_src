@@ -888,7 +888,11 @@ PRODUCT_GRASP_PROFILES = {
         "tissue_top_depth_bias": -0.004,
         "tissue_top_lateral_bias": 0.0,
         "tissue_top_lift": 0.0,
-        "tissue_top_pull": 0.350,
+        # Offline grid reached S3 (224.6 mm dual-finger displacement) with a
+        # post-close inset of 75 mm; the full 350 mm pull overshot S3 and the
+        # box slipped on the last segment.  Pull only just past the 200 mm S3
+        # threshold while still dual-contacted, then hand off to carry.
+        "tissue_top_pull": 0.240,
         "tissue_top_waypoint_tolerance": 0.025,
         "tissue_top_waypoint_dwell": 0.18,
         "grip_close_target": 0.0,
