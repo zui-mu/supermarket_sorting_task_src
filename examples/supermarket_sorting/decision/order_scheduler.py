@@ -15,7 +15,7 @@ class SchedulerConfig:
     heuristics here so the robot does not keep changing its mind at the shelf.
     """
 
-    level_order: tuple[str, ...] = ("L2", "L3", "L1")
+    level_order: tuple[str, ...] = ("L1", "L2", "L3")
 
 
 class OrderScheduler:
@@ -23,7 +23,7 @@ class OrderScheduler:
 
     Order:
     1. left to right by world/navigation X
-    2. for the same horizontal position: middle, upper, lower
+    2. for the same horizontal position: lower, middle, upper
     3. stable text keys as deterministic tie-breakers
     """
 

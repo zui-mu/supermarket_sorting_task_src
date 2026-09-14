@@ -61,6 +61,35 @@ fi
 # A detached bare `bash` is not a reliable container init process: on some
 # Docker/WSL combinations it exits before the two exec'd ROS nodes start.
 # Keep an explicit idle PID 1 for the full test lifecycle.
+#
+# 2026-08-23 (audit) - SUPERMARKET_USE_GS default flipped 0 -> 1.
+#
+# This runner used to force the plain MuJoCo rasteriser because "the 3DGS
+# backend can hang during its first EGL frame on headless Docker Desktop".
+# That caution made every formal run undetectable, because the checkpoint is
+# trained ONLY on 3DGS frames (perception/gen_dataset.py hard-codes
+# cfg.use_gaussian_renderer = True and binds the retail 3DGS background), so
+# `USE_GS=0` fed the detector a rendering domain it had never seen.
+#
+# Measured with scripts/probe_yolo_live_pose.py, same slot, same pose, shipping
+# checkpoint, production loader and BGR input:
+#
+#   USE_GS=1  8/10 slots -> correct class, rich detections
+#             (heweidao:0.96, heweidao:0.92, kele:0.92 ...)
+#   USE_GS=0  0/10 slots -> constant nonsense (zhijin:0.93..1.00 on everything)
+#
+# The same probe renders 3DGS successfully under headless EGL in this
+# environment, so the hang the old comment feared does not reproduce here.
+# The server's own default (`SUPERMARKET_USE_GS`, build_config) is 1 as well;
+# 0 was purely a local over-ride.  Override with SUPERMARKET_USE_GS=0 only for
+# rasteriser A/B work.
+#
+# 2026-08-23: render at the checkpoint's own training resolution.  This script
+# used to default to 480x360, i.e. barely half the pixels of the 640x480 images
+# the detector was trained and validated on.
+#
+# NOTE: the durable fix is to make the checkpoint domain-independent rather than
+# to depend on this flag - see `--use-gs` in perception/gen_dataset.py.
 docker run -dit \
   --gpus all \
   --network host \
@@ -86,9 +115,10 @@ docker run -dit \
   -e SUPERMARKET_OBSTACLE_SEED="${SUPERMARKET_OBSTACLE_SEED:-11}" \
   -e SUPERMARKET_TASK_COUNT="${TASK_COUNT}" \
   -e SUPERMARKET_TASK_ANONYMOUS="${TASK_ANONYMOUS}" \
+  -e SUPERMARKET_TARGETS="${SUPERMARKET_TARGETS:-}" \
   -e SUPERMARKET_RENDER_FPS="${SUPERMARKET_RENDER_FPS:-6}" \
-  -e SUPERMARKET_RENDER_WIDTH="${SUPERMARKET_RENDER_WIDTH:-480}" \
-  -e SUPERMARKET_RENDER_HEIGHT="${SUPERMARKET_RENDER_HEIGHT:-360}" \
+  -e SUPERMARKET_RENDER_WIDTH="${SUPERMARKET_RENDER_WIDTH:-640}" \
+  -e SUPERMARKET_RENDER_HEIGHT="${SUPERMARKET_RENDER_HEIGHT:-480}" \
   "${server_mounts[@]}" \
   "${SERVER_IMAGE}" \
   bash -lc "cd ${ROOT} && ./scripts/run_v2_server.sh"
@@ -160,6 +190,7 @@ docker run -dit \
   -e SUPERMARKET_BASELINE_WEIGHTS="${SUPERMARKET_BASELINE_WEIGHTS:-}" \
   -e SUPERMARKET_ENABLE_AVOIDANCE="${SUPERMARKET_ENABLE_AVOIDANCE:-1}" \
   -e SUPERMARKET_ENABLE_DEPTH_AVOIDANCE="${SUPERMARKET_ENABLE_DEPTH_AVOIDANCE:-1}" \
+  -e SUPERMARKET_DELIVERY_USE_ASTAR="${SUPERMARKET_DELIVERY_USE_ASTAR:-1}" \
   -e SUPERMARKET_TASK_FALLBACK_ORDER="${SUPERMARKET_TASK_FALLBACK_ORDER:-}" \
   -e SUPERMARKET_TEST_ORACLE="${SUPERMARKET_TEST_ORACLE:-0}" \
   -e SUPERMARKET_REQUEST_SERVER_RESET="${SUPERMARKET_REQUEST_SERVER_RESET:-0}" \

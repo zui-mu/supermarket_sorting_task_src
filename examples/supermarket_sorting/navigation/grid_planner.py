@@ -37,13 +37,29 @@ class SupermarketGridPlanner:
     """Eight-connected A* with obstacle inflation and line-of-sight pruning."""
 
     # World positions are taken from retail_competition.xml.  Rectangles store
-    # physical extents; robot clearance is applied separately.
+    # physical extents; robot clearance is applied separately (see
+    # EXTRA_CLEARANCE_OBSTACLES below).  Order within this tuple is irrelevant.
     STATIC_OBSTACLES = (
+        # corridor_right_board: MJCF retail_competition.xml nests the geom under
+        # body dynamic_obstacle_corridor pos=(-0.96, -1.01, 0).  The geom local
+        # pos=(1.49, 0, 0.75) and half-size=(0.03, 2.71, 0.75) compile to world
+        # x in [0.50, 0.56], y in [-3.72, 1.70].  Do not treat geom.pos as a
+        # world coordinate; doing so invents a phantom wall at x~1.49 and omits
+        # the real divider.
+        Rect(0.50, 0.56, -3.72, 1.70),       # corridor_right_board
         # These are the invariant MJCF structures.  The five cardboard boxes
         # are intentionally *not* listed here: V2 randomises them each run,
         # so their occupancy must come from the public LaserScan.
-        Rect(0.50, 0.56, -3.72, 1.70),       # corridor_right_board
         Rect(-2.420, -1.460, -3.630, -3.190),  # delivery table
+        # The five shelves: body shelf_<X> at y=3.323 with a 0.43 x 0.15 board
+        # footprint, so world y in [3.173, 3.473] and x = centre +- 0.43.
+        # Centres from retail_competition_layout.json: -1.735 / -0.850 /
+        # 0.035 / 0.920 / 1.805.
+        Rect(-2.165, -1.305, 3.173, 3.473),  # shelf_A
+        Rect(-1.280, -0.420, 3.173, 3.473),  # shelf_B
+        Rect(-0.395, 0.465, 3.173, 3.473),   # shelf_C
+        Rect(0.490, 1.350, 3.173, 3.473),    # shelf_D
+        Rect(1.375, 2.235, 3.173, 3.473),    # shelf_E
         # Perimeter walls (retail_competition.xml, size 0.03).  Without them
         # the wall surfaces enter the lidar dynamic set and get inflated like
         # boxes, which can close a real wall-side passage (verified: the west
@@ -59,13 +75,41 @@ class SupermarketGridPlanner:
         self,
         resolution: float = 0.10,
         robot_radius: float = 0.22,
-        corridor_clearance: float = 0.45,
+        corridor_clearance: float | None = None,
         dynamic_clearance: float | None = None,
-        bounds: tuple[float, float, float, float] = (-2.35, 2.35, -3.48, 3.02),
+        # 2026-08-23: ymax raised 3.02 -> 3.50 so shelf lidar hits stay inside
+        # the grid instead of being clamped onto the top boundary row, where
+        # their inflation used to swallow the whole picking line.
+        bounds: tuple[float, float, float, float] = (-2.35, 2.35, -3.48, 3.50),
     ):
         self.resolution = float(resolution)
         self.robot_radius = float(robot_radius)
-        self.corridor_clearance = float(corridor_clearance)
+        # ``corridor_clearance`` is CLAMPED to ``robot_radius`` and therefore
+        # never widens the static map.  It used to give one structure (chosen by
+        # tuple position!) a larger envelope than the chassis, on the premise
+        # that a carried package sticks out further than the robot.  Measured,
+        # that premise is false - the outermost carried surface is
+        # RIGHT_ARM_OBJECT_X_OFFSET (0.108) + half a package (~0.10) = 0.21 m,
+        # which is *inside* robot_radius (0.22 m) - and the larger envelope cost
+        # real arena connectivity:
+        #
+        #   divider east face x=0.56, east wall inner face x=2.47 -> 1.91 m wide
+        #   free centre band width = (2.47 - 0.22) - 0.56 - c = 1.69 - c
+        #
+        # so c=0.65 (the client's unloaded default) left a 0.08 m band, c=0.88
+        # none at all, and - because shelf picking poses lie inside the
+        # divider's y span - over-inflating it can still delete real passages.
+        # Every static structure now inflates by robot_radius, exactly like the
+        # walls.
+        #
+        # The argument is kept because callers pass it and it is part of the
+        # public signature; a future change should delete it, not widen it.
+        self.corridor_clearance = min(
+            float(robot_radius)
+            if corridor_clearance is None
+            else float(corridor_clearance),
+            float(robot_radius),
+        )
         # Dynamic points come from lidar/depth and represent obstacle centres,
         # so a loaded robot may need a larger envelope than the bare chassis.
         self.dynamic_clearance = float(
@@ -74,9 +118,8 @@ class SupermarketGridPlanner:
         self.xmin, self.xmax, self.ymin, self.ymax = bounds
         self.width = int(round((self.xmax - self.xmin) / self.resolution)) + 1
         self.height = int(round((self.ymax - self.ymin) / self.resolution)) + 1
-        self.static_rects = (
-            self.STATIC_OBSTACLES[0].inflated(self.corridor_clearance),
-            *(rect.inflated(self.robot_radius) for rect in self.STATIC_OBSTACLES[1:]),
+        self.static_rects = tuple(
+            rect.inflated(self.robot_radius) for rect in self.STATIC_OBSTACLES
         )
         # Raw (uninflated) footprints, used to discard lidar hits that land on
         # the modelled structures themselves.  Without this, a lidar hit on the

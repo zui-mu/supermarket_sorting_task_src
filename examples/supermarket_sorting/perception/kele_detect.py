@@ -232,6 +232,14 @@ class KeleDetectNode(Node):
         surface cluster - i.e. the nearest solid surface, which is the product
         face, not what is behind it.  Returns metres or 0.0 when unusable.
         """
+        sample = KeleDetectNode.robust_bbox_surface_sample(
+            depth_img, x0, y0, x1, y1, frac=frac, depth_max=depth_max
+        )
+        return float(sample[2]) if sample is not None else 0.0
+
+    @staticmethod
+    def robust_bbox_surface_sample(depth_img, x0, y0, x1, y1, *, frac=0.4, depth_max=2.0):
+        """Return (u, v, depth_m) from the nearest coherent central depth cluster."""
         h, w = depth_img.shape[:2]
         cx = (x0 + x1) / 2.0
         cy = (y0 + y1) / 2.0
@@ -243,18 +251,29 @@ class KeleDetectNode(Node):
         v0 = max(0, int(cy - hh))
         v1 = min(h, int(cy + hh) + 1)
         if u1 <= u0 or v1 <= v0:
-            return 0.0
+            return None
         region = depth_img[v0:v1, u0:u1].astype(np.float32)
-        valid = region[region > 0]
-        if len(valid) == 0:
-            return 0.0
+        valid_mask = region > 0
+        if not np.any(valid_mask):
+            return None
         # Metres; drop far background (shelf behind product).
-        valid_m = valid * 1e-3
-        valid_m = valid_m[valid_m < depth_max]
+        region_m = region * 1e-3
+        valid_mask &= region_m < depth_max
+        valid_m = region_m[valid_mask]
         if len(valid_m) == 0:
-            return 0.0
-        # Nearest-surface cluster: low percentile of the near side.
-        return float(np.percentile(valid_m, 15))
+            return None
+        near_depth = float(np.percentile(valid_m, 15))
+        cluster_mask = valid_mask & (np.abs(region_m - near_depth) <= 0.04)
+        if int(np.count_nonzero(cluster_mask)) < 4:
+            cluster_mask = valid_mask & (region_m <= near_depth + 0.025)
+        if not np.any(cluster_mask):
+            return None
+        vv, uu = np.where(cluster_mask)
+        cluster_depth = region_m[cluster_mask]
+        u_med = float(np.median(uu + u0))
+        v_med = float(np.median(vv + v0))
+        depth_med = float(np.median(cluster_depth))
+        return u_med, v_med, depth_med
 
     # ---- main RGB callback ----
     def rgb_cb(self, msg: Image):
@@ -283,16 +302,29 @@ class KeleDetectNode(Node):
         vis = rgb.copy() if self.pub_res_img else rgb
         for det_index, d in enumerate(dets):
             u, v = int(d["x"]), int(d["y"])
-            # PR2: use the central-box robust depth instead of a single-pixel
-            # patch (single pixel can hit packaging/shelf/transparent edge).
-            depth_m = self.robust_bbox_depth_m(
+            # Use the nearest coherent central depth cluster, and deproject
+            # that cluster's own pixel median.  Mixing bbox-centre (u, v) with
+            # a low-percentile depth from some other pixel fabricates 3-D
+            # points that do not exist in the image.
+            surface_sample = self.robust_bbox_surface_sample(
                 depth, int(d["x"]) - int(d["w"]) // 2, int(d["y"]) - int(d["h"]) // 2,
                 int(d["x"]) + int(d["w"]) // 2, int(d["y"]) + int(d["h"]) // 2,
             )
-            if depth_m <= 0.0:
+            if surface_sample is None:
                 continue
-            p_cam = self.pixel_to_cam(u, v, depth_m)
-            p_world = (T_cam_world @ np.array([p_cam[0], p_cam[1], p_cam[2], 1.0]))[:3]
+            sample_u, sample_v, depth_m = surface_sample
+            p_cam = self.pixel_to_cam(sample_u, sample_v, depth_m)
+            if "gt_world_pos" in d:
+                # GT backend is the "perfect perception" reference: publish the
+                # exact GT centre instead of the depth-deprojected surface point.
+                # Deprojection reads the bottle-surface z (0.03-0.1 m above the
+                # true centre, frame-to-frame unstable); combined with the
+                # client's surface_to_center_z compensation the vision monitor
+                # then sees a fake 0.107 m z-shift and aborts every grasp with
+                # "vision saw target displaced" (regression from Round 61f).
+                p_world = np.asarray(d["gt_world_pos"], dtype=float)
+            else:
+                p_world = (T_cam_world @ np.array([p_cam[0], p_cam[1], p_cam[2], 1.0]))[:3]
 
             rec = {
                 "class": d["class"],

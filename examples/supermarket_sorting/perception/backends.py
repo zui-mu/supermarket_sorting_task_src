@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 Pluggable 2-D detector backends for the kele perception pipeline.
 
@@ -232,7 +232,18 @@ class YoloBackend:
     not "succeed" while silently returning empty detections.
     """
 
-    def __init__(self, ckpt_path: str, conf_thresh: float = 0.65):
+    def __init__(self, ckpt_path: str, conf_thresh: float | None = None):
+        # 2026-08-23 (critical): the threshold used to be hard-wired to 0.65.
+        # Measured live, the ONLY detections that survived it were the classes
+        # the model is most confident about: zhijin (conf 0.663 - i.e. just
+        # barely over the line), pingguo and chengzi.  Every one of the four
+        # ordered kinds (sanmingzhi / heweidao / shupian / maidong) scored below
+        # 0.65 and was silently discarded, so the anonymous search could never
+        # bind them and every official run finished with 0 completed orders.
+        # 0.65 is far above the usual YOLO default (0.25); the downstream slot
+        # association + class-consensus gates reject false positives anyway.
+        if conf_thresh is None:
+            conf_thresh = float(os.getenv("SUPERMARKET_YOLO_CONF", "0.30"))
         self.conf_thresh = conf_thresh
         self.model = None
         self.class_names = {}

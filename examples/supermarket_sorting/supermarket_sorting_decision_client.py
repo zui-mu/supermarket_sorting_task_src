@@ -29,6 +29,7 @@ from decision.task_manager import TaskManager
 from manipulation.arm_capabilities import requires_mirrored_left_arm
 from supermarket_sorting_client import (
     DEPLOY,
+    DETECT_MIN_SAMPLES,
     DONE,
     NAV_SHELF,
     PHASE_NAME,
@@ -36,6 +37,7 @@ from supermarket_sorting_client import (
     REACH_FWD_MIN,
     REACH_Z_MAX,
     REACH_Z_MIN,
+    VISION_SURFACE_TO_CENTER_FWD,
     PickPlaceClient,
 )
 
@@ -229,9 +231,87 @@ class DecisionPickPlaceClient(PickPlaceClient):
         lock comes only from schema-v3 ArUco-bound observations.
         """
         if self.active_search_mode() and not self.target_locked:
-            self.detection_stream_seen_at = self.now()
+            # PR7: do not fully short-circuit the generic detection stream in
+            # search mode.  The base class accumulates a bare detection ONLY
+            # after strict slot association (search_slot_world gates + class
+            # consensus), which is a legitimate lock source for L1/L2 shelf
+            # levels where the ArUco tag is occluded by the shelf board edge
+            # from the head camera (verified: L3 tags detect at pitch 0..-0.4,
+            # L2/L1 tags never detect at any pitch; the old single-source
+            # ArUco gate therefore made L1/L2 slots permanently un-lockable).
+            # Keep the heartbeat, but let the base class decide whether the
+            # detection is reachable + slot-associated.
+            super().det_cb(msg)
             return
         super().det_cb(msg)
+
+    def _lock_search_via_det_buf(self):
+        """Lock a search slot from generic detections when ArUco is occluded.
+
+        Mirrors the base-class det_buf lock but keeps the search-mode
+        semantics: the base `det_cb` already gated every sample against
+        `search_slot_world` (column/level association) and applied class
+        consensus via `bind_detected_search_product`, so `det_buf` holds
+        only reachable, slot-associated, class-consensus'd samples of the
+        confirmed product kind.  Here we finish the lock exactly like the base
+        class would: median sample -> reach gate -> grasp geometry.
+        """
+        if len(self.det_buf) < DETECT_MIN_SAMPLES:
+            return False
+        arr = np.array(list(self.det_buf))
+        candidate = np.median(arr, axis=0)
+        fp = self.world_to_footprint(candidate)
+        reach_lateral_max = float(self.grasp_profile.get("reach_lateral_max", 0.35))
+        if (
+            fp[0] < REACH_FWD_MIN or fp[0] > REACH_FWD_MAX
+            or abs(fp[1]) > reach_lateral_max
+            or candidate[2] < REACH_Z_MIN or candidate[2] > REACH_Z_MAX
+        ):
+            self.get_logger().warn(
+                f"[fresh_grasp] discard unreachable search candidate: "
+                f"world={np.round(candidate,3)} fp={np.round(fp,3)}")
+            self.det_buf.clear()
+            return False
+        # PR7b: the YOLO world point is the visible package surface.  Do NOT
+        # apply the legacy surface_to_center_z lift (it double-counts and
+        # pushes the tissue_top outside-gateway target above the IK envelope),
+        # but DO clamp the pose to the fixed ArUco slot like the schema-v3
+        # path does: the slot carries the true shelf Y and level-fused Z
+        # (slot world_position z = surface + product half height), which is
+        # exactly what the tissue_top gateway IK expects (verified: raw YOLO
+        # surface z=1.227 -> gateway z=1.927 unreachable; slot z=1.229 works).
+        fp_c = self.world_to_footprint(candidate)
+        fp_c[0] += float(self.grasp_profile.get(
+            "surface_to_center_fwd", VISION_SURFACE_TO_CENTER_FWD))
+        object_world = self.footprint_to_world(fp_c)
+        manager = getattr(self, "task_manager", None)
+        if (
+            manager is not None
+            and self.active_task is not None
+            and hasattr(self.active_task, "aruco_id")
+        ):
+            slot = manager.slot_by_aruco.get(int(self.active_task.aruco_id))
+            if slot is not None:
+                try:
+                    slot_world = tuple(float(value) for value in slot["world_position"])
+                    # Keep X from vision (bounded lateral correction), use the
+                    # slot Y/Z for the grasp pose like _inventory_world_for_slot.
+                    object_world[0] = float(candidate[0])
+                    object_world[1] = slot_world[1]
+                    object_world[2] = slot_world[2]
+                except (KeyError, TypeError, ValueError):
+                    object_world[2] = float(candidate[2])
+        if not self._neighbor_clearance_ok(object_world):
+            self.det_buf.clear()
+            return False
+        self.lock_grasp_geometry(object_world, source="vision")
+        self.get_logger().info(
+            f"[fresh_grasp] locked search slot via generic detections "
+            f"(ArUco occluded): kind={self.active_product_name} "
+            f"world={np.round(object_world, 3)} samples={len(self.det_buf)}"
+        )
+        self._trace("search_lock_via_det_buf", self.active_payload)
+        return True
 
     def _lock_target(self):
         if not self.active_search_mode():
@@ -241,14 +321,23 @@ class DecisionPickPlaceClient(PickPlaceClient):
         if not self._fresh_grasp_platform_stable():
             return False
         if not self.task_manager.apply_fresh_grasp_observation(self.active_task):
-            if self.now() - self.last_wait_log > 1.0:
-                self.get_logger().info(
-                    "[fresh_grasp] waiting for 3 current, stable frames bound to "
-                    f"ArUco {self.active_task.aruco_id} and {self.active_product_name}"
-                )
-                self.last_wait_log = self.now()
-            return False
-
+            # PR7: ArUco-bound fresh grasp is the preferred lock, but on L1/L2
+            # levels the tag is physically occluded from the head camera (tag
+            # sits on the board front edge; at the required deep down-pitch the
+            # board edge hides the lower half -> decode fails).  Fall back to
+            # the base-class generic-detection lock: YOLO detects the product,
+            # the base gates it against search_slot_world and class consensus,
+            # then locks from det_buf.  This restores L1/L2 lockability without
+            # weakening the class/slot gates.
+            if len(self.det_buf) < DETECT_MIN_SAMPLES:
+                if self.now() - self.last_wait_log > 1.0:
+                    self.get_logger().info(
+                        "[fresh_grasp] waiting for 3 current, stable frames bound to "
+                        f"ArUco {self.active_task.aruco_id} and {self.active_product_name}"
+                    )
+                    self.last_wait_log = self.now()
+                return False
+            return self._lock_search_via_det_buf()
         surface_world = np.asarray(self.active_task.fresh_grasp_world, dtype=float)
         # The schema-v3 RGB-D point is the visible package surface.  Reuse the
         # per-product forward calibration used by the generic detection path,
@@ -634,9 +723,33 @@ class DecisionPickPlaceClient(PickPlaceClient):
                     and self.active_target_knocked_or_dropped()
                 )
                 delivery_exhausted = reason.startswith("delivery navigation recovery limit exceeded")
+                # 2026-08-23: the tissue box gets exactly ONE attempt.  Its
+                # top-pinch sequence is a long, currently-unsolved manipulation
+                # (vertical descent never settles) and a retry re-runs the whole
+                # re-approach, which can burn minutes of the 600 s budget for a
+                # guaranteed failure.  Retire the slot and work the next order -
+                # the remaining "search_XX" tasks for the same kind still cover
+                # the other four shelf positions.
+                tissue_abandoned = "tissue top" in reason or "tissue" in reason.lower()
                 # Once S3 is confirmed the object may still be physically in the
                 # gripper. Only continue to another task when the referee/drop
                 # logic says the object is already gone; otherwise hold safely.
+                #
+                # 2026-08-23: delivery_exhausted MUST be excluded here.  The
+                # delivery recovery budget running out is our own navigation
+                # failure, not evidence that the object is intact and worth
+                # holding: without this exclusion the soft-hold expired and set
+                # _orders_finished=True, freezing the whole match with the
+                # remaining orders abandoned (7 official runs scored 0 this
+                # way).  Release in place and keep working the order list.
+                if self.grasp_was_confirmed and not dropped and delivery_exhausted:
+                    self.get_logger().warn(
+                        '[decision] delivery recovery exhausted while carrying; '
+                        'releasing the object in place and continuing with the '
+                        'remaining orders instead of freezing the match'
+                    )
+                    self.release_carried_in_place()
+                    dropped = True
                 if self.grasp_was_confirmed and not dropped:
                     if self.has_active_drop_report():
                         # The referee confirmed the carried object is already
@@ -698,7 +811,13 @@ class DecisionPickPlaceClient(PickPlaceClient):
                             return
                 task = self.task_manager.mark_task_failed(
                     self.active_task.task_id,
-                    requeue=not (dropped or toppled or stale_or_skip_target or delivery_exhausted),
+                    requeue=not (
+                        dropped
+                        or toppled
+                        or stale_or_skip_target
+                        or delivery_exhausted
+                        or tissue_abandoned
+                    ),
                 )
                 self.get_logger().warn(
                     '[decision] task failed: %s reason=%s' %

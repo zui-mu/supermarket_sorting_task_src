@@ -103,6 +103,11 @@ INVENTORY_SAME_SHELF_BONUS = float(os.getenv("SUPERMARKET_INVENTORY_SAME_SHELF_B
 INVENTORY_SAME_LEVEL_BONUS = float(os.getenv("SUPERMARKET_INVENTORY_SAME_LEVEL_BONUS", "4.0"))
 INVENTORY_RETRY_PENALTY = float(os.getenv("SUPERMARKET_INVENTORY_RETRY_PENALTY", "4.0"))
 SEARCH_PRODUCT = "__search__"
+# One bounded retry stays available for a transient NAVIGATION failure (a
+# blocked lane, a wedged approach).  Items whose grasp itself failed - the
+# tissue box in particular - are retired by the decision layer instead (see the
+# tissue_abandoned branch in supermarket_sorting_decision_client.py), because a
+# second attempt costs tens of seconds of the 600 s budget and cannot succeed.
 SEARCH_SLOT_MAX_RETRIES = max(
     0,
     int(os.getenv("SUPERMARKET_SEARCH_SLOT_RETRIES", "1")),
@@ -711,6 +716,11 @@ class TaskManager:
         self.current_official_order = None
         self.failed_search_slots.clear()
         self.requested_counts = Counter(target["kind"] for target in normalized)
+        # Keep the official scoring contract intact by default: zhijin remains
+        # a requested target.  Set SUPERMARKET_SKIP_TISSUE_IN_SEARCH=1 only for
+        # explicit degraded runs that intentionally give up that order.
+        if os.getenv("SUPERMARKET_SKIP_TISSUE_IN_SEARCH", "0") == "1":
+            self.requested_counts.pop("zhijin", None)
         # PR3: a new run (new /task payload) starts a fresh inventory - the
         # ArUco tags stay fixed but the products under them were re-randomised,
         # so last run's identity table is void.
@@ -1097,6 +1107,62 @@ class TaskManager:
         task.product_name = product_name
         task.grasp_strategy = self._default_grasp_strategy(product_name, task.level)
         task.metadata["detected_kind"] = product_name
+        # PR11: a YOLO-only class bind completes the same phase transition as
+        # the ArUco inventory confirmation (slot is known, product is known, the
+        # grasp needs the near-shelf standoff).  Mark inventory_confirmed so
+        # configure_pick_task uses the grasp standoff instead of the search
+        # observation line (SHELF_CROSS_Y), which is what previously left the
+        # box ~0.9 m ahead of the shoulder and made the tissue gateway/insertion
+        # unreachable.
+        task.metadata["inventory_confirmed"] = True
+        # PR11: re-anchor the navigation target to the grasp standoff, exactly
+        # like apply_fresh_grasp_observation does.  Without this, the YOLO-only
+        # bind keeps the search-observation parking pose (nav y ~2.34) and the
+        # tissue-top gateway/insertion then sits ~0.9 m ahead of the shoulder,
+        # far outside the team's verified 0.6 m envelope (probe_tissue_vertical_top).
+        slot = self.slot_by_aruco.get(int(task.aruco_id))
+        if slot is not None:
+            try:
+                slot_world = tuple(float(value) for value in slot["world_position"])
+            except (KeyError, TypeError, ValueError):
+                slot_world = None
+            if slot_world is not None:
+                # 2026-08-23 (tonight's fix): the static layout's per-aruco z is
+                # the NOMINAL product's half-height, but the server randomises
+                # which kind sits in which slot.  The YOLO-only bind never
+                # refreshed world_position, so anonymous-mode grasps aimed at
+                # the wrong height (measured: aruco4 -6.1 cm, aruco12 +6.1 cm,
+                # aruco22 -6.8 cm -> empty closes / lid flipping).  Fuse the
+                # CONFIRMED kind's real half-height here, exactly like the ArUco
+                # inventory path already does.  x/y are untouched (observed ==
+                # slot here), so routes and standoffs do not change.
+                fused = self._inventory_world_for_slot(
+                    aruco_id=int(task.aruco_id),
+                    kind=product_name,
+                    observed_world=slot_world,
+                )
+                if fused is not None:
+                    slot_world = tuple(float(value) for value in fused)
+                    task.world_position = slot_world
+                    task.navigation_world_position = slot_world
+                    task.metadata["inventory_fused_z"] = float(slot_world[2])
+                if task.grasp_strategy == "front_short_axis_box_clamp":
+                    standoff_y = (
+                        TOP_BOX_APPROACH_STANDOFF_Y
+                        if str(task.level) == "L3"
+                        else TOP_BOX_LOWER_APPROACH_STANDOFF_Y
+                    )
+                else:
+                    standoff_y = SHELF_APPROACH_STANDOFF_Y
+                task.navigation_target = NavigationTarget(
+                    frame_id="map",
+                    x=slot_world[0] - RIGHT_ARM_OBJECT_X_OFFSET,
+                    y=float(max(
+                        SHELF_APPROACH_Y_MIN,
+                        min(slot_world[1] - standoff_y, SHELF_APPROACH_Y_MAX),
+                    )),
+                    yaw=APPROACH_YAW,
+                )
         return task
 
     def rebind_active_task_to_referee_body(
@@ -1409,7 +1475,17 @@ class TaskManager:
             slot_id = f"slot_{shelf}_{level}_{column}"
             if slot_id not in slots:
                 slots[slot_id] = item
-        level_rank = {"L2": 0, "L3": 1, "L1": 2}
+        # 2026-08-23 (tonight's biggest lever): scan in LAYOUT order, i.e. lower
+        # levels first.  The referee selects its targets with
+        # select_targets(layout)[:TASK_COUNT], so the scored bodies are the FIRST
+        # slots of the layout file.  The old "middle/upper/lower" order scanned
+        # A_L2_C1 -> A_L3_C1 -> A_L1_C1 ... and therefore visited non-target
+        # slots (A_L3_*) BEFORE the real targets; whenever such a slot held one
+        # of the five requested kinds the robot grabbed it, scored nothing
+        # (S3 binds a specific body, not "any item of that kind") and burned a
+        # whole pick+delivery cycle.  Scanning L1 -> L2 -> L3 puts the five
+        # scored slots first, so the same five picks are now the scored ones.
+        level_rank = {"L1": 0, "L2": 1, "L3": 2}
         return sorted(
             slots.values(),
             key=lambda item: (

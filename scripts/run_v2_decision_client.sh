@@ -16,7 +16,10 @@ export SUPERMARKET_LOCAL_GRASP_RETRIES="${SUPERMARKET_LOCAL_GRASP_RETRIES:-3}"
 export SUPERMARKET_DROP_RECOVERIES="${SUPERMARKET_DROP_RECOVERIES:-3}"
 export SUPERMARKET_MAX_DELIVERY_RECOVERIES="${SUPERMARKET_MAX_DELIVERY_RECOVERIES:-8}"
 export SUPERMARKET_DELIVERY_RECOVERY_COOLDOWN="${SUPERMARKET_DELIVERY_RECOVERY_COOLDOWN:-1.5}"
-export SUPERMARKET_CARRY_TUCK_ENABLED="${SUPERMARKET_CARRY_TUCK_ENABLED:-1}"
-export SUPERMARKET_DELIVERY_USE_ASTAR="${SUPERMARKET_DELIVERY_USE_ASTAR:-0}"
+export SUPERMARKET_CARRY_TUCK_ENABLED="${SUPERMARKET_CARRY_TUCK_ENABLED:-0}"
+# Official rounds randomize five obstacles. Plan the loaded delivery route
+# from launch so dynamic obstacles are avoided before contact; the client
+# retains its corridor fallback when A* has no safe route.
+export SUPERMARKET_DELIVERY_USE_ASTAR="${SUPERMARKET_DELIVERY_USE_ASTAR:-1}"
 
 exec /usr/bin/python3 examples/supermarket_sorting/supermarket_sorting_decision_client.py

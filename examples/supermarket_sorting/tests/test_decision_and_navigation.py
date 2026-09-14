@@ -163,7 +163,7 @@ class TaskManagerTests(unittest.TestCase):
         self.assertTrue(all(task.product_name == SEARCH_PRODUCT for task in tasks))
         self.assertEqual(
             [task.slot_id for task in manager.scheduler.rank_tasks(tasks)[:3]],
-            ["slot_A_L2_C1", "slot_A_L3_C1", "slot_A_L1_C1"],
+            ["slot_A_L1_C1", "slot_A_L2_C1", "slot_A_L3_C1"],
         )
 
     def test_all_product_order_preserves_layout_order(self):
@@ -338,8 +338,14 @@ class TaskManagerTests(unittest.TestCase):
 
     def test_search_slot_is_retired_for_static_unreachable_arm_geometry(self):
         manager = TaskManager()
+        # NOTE 2026-08-23: this used "zhijin" as its example kind.  The tissue
+        # box is now filtered out of the search order
+        # (SUPERMARKET_SKIP_TISSUE_IN_SEARCH) until its top-pinch descent works,
+        # so the target here is an ordinary product.  The behaviour under test -
+        # retiring a slot blocked by static arm geometry instead of retrying it
+        # - is unchanged.
         manager.build_search_tasks_for_targets([
-            {"id": "item_01", "kind": "zhijin"},
+            {"id": "item_01", "kind": "sanmingzhi"},
         ])
         active = manager.next_decision().selected_task
 
@@ -1001,6 +1007,46 @@ class YoloBackendTests(unittest.TestCase):
 
 
 class NavigationTests(unittest.TestCase):
+    def test_official_runner_enables_loaded_delivery_astar(self):
+        """Formal runs must plan around the randomized obstacle set from launch."""
+        decision_runner = (REPO_ROOT / "scripts" / "run_v2_decision_client.sh").read_text(
+            encoding="utf-8"
+        )
+        official_runner = (REPO_ROOT / "scripts" / "run_v2_official_test.sh").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn(
+            'export SUPERMARKET_DELIVERY_USE_ASTAR="${SUPERMARKET_DELIVERY_USE_ASTAR:-1}"',
+            decision_runner,
+        )
+        self.assertIn(
+            '-e SUPERMARKET_DELIVERY_USE_ASTAR="${SUPERMARKET_DELIVERY_USE_ASTAR:-1}"',
+            official_runner,
+        )
+        # 2026-08-23: was pinned to USE_GS=0.  That value made every formal run
+        # undetectable, because the shipped checkpoint is trained ONLY on 3DGS
+        # frames while USE_GS=0 renders with the plain MuJoCo rasteriser.
+        # Measured (scripts/probe_yolo_live_pose.py, same slot/pose/checkpoint):
+        # 8/10 correct with 3DGS on, 0/10 with it off.  Pin the invariant - the
+        # formal runner must not force the rasteriser - instead of a literal, so
+        # the flag can be overridden for A/B work without breaking this test.
+        self.assertNotIn(
+            '-e SUPERMARKET_USE_GS="${SUPERMARKET_USE_GS:-0}"',
+            official_runner,
+            "the formal runner must not force the rasteriser the detector was "
+            "never trained on",
+        )
+        self.assertIn("SUPERMARKET_USE_GS", official_runner)
+        # The dataset generator must be able to cover both render domains, so
+        # the detector stops depending on which one the grader uses.
+        gen_dataset = (
+            REPO_ROOT / "examples" / "supermarket_sorting" / "perception"
+            / "gen_dataset.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn('"--use-gs"', gen_dataset)
+        self.assertIn('choices=["0", "1", "both"]', gen_dataset)
+
     def test_zhijin_empty_grasp_retry_advances_depth_without_x_sweep(self):
         fake_modules = {
             "rclpy": types.SimpleNamespace(init=lambda: None, spin=lambda node: None, ok=lambda: False, shutdown=lambda: None),
@@ -1083,9 +1129,32 @@ class NavigationTests(unittest.TestCase):
     def test_only_invariant_structures_are_static(self):
         # V2 randomises cardboard-box poses, so they must enter through lidar
         # observations rather than stale coordinates in the global map. The
-        # static set holds the divider, the delivery table and the four
-        # perimeter walls (all invariant MJCF structures).
-        self.assertEqual(len(SupermarketGridPlanner.STATIC_OBSTACLES), 6)
+        # static set holds the divider, the delivery table, the four perimeter
+        # walls AND the five shelves (all invariant MJCF structures).
+        #
+        # 2026-08-23: the shelves were missing from this set, so their lidar
+        # hits became dynamic obstacles; combined with the old grid ceiling
+        # (ymax=3.02) those hits were clamped onto the boundary row and their
+        # inflation covered the entire picking line, making every loaded A*
+        # return no route.  Added here with a test that keeps the ORIGINAL
+        # intent (randomised boxes must never be static) explicitly protected.
+        rects = SupermarketGridPlanner.STATIC_OBSTACLES
+        self.assertEqual(len(rects), 11)
+        # The five shelves occupy the band y in [3.173, 3.473].
+        shelf_band = [
+            r for r in rects
+            if 3.17 <= r.ymin <= 3.18 and 3.47 <= r.ymax <= 3.48
+        ]
+        self.assertEqual(len(shelf_band), 5)
+        # Keep the ORIGINAL intent protected: a randomised cardboard box must
+        # never be baked into the global map.  MJCF places them around the
+        # arena centre (e.g. dynamic_obstacle_box_05 at (-0.110, 0.813)).
+        for box_x, box_y in ((-0.110, 0.813), (0.29, 1.32)):
+            self.assertFalse(
+                any(r.contains(box_x, box_y) for r in rects),
+                f"randomised box centre ({box_x}, {box_y}) sits inside a "
+                "static obstacle footprint",
+            )
 
     def test_lidar_hits_on_static_structures_are_not_double_inflated(self):
         # A hit on the west wall face belongs to the static wall model; adding
@@ -1117,7 +1186,12 @@ class NavigationTests(unittest.TestCase):
 
     def test_pruned_route_does_not_cross_static_obstacles(self):
         planner = SupermarketGridPlanner()
-        start = (1.60, 2.05)
+        # 2026-08-23: the original start (1.60, 2.05) came from the era when the
+        # divider was modelled at x~0.53.  Against the real board (x in [1.46,
+        # 1.52]) it puts the robot centre 8 cm from the board face - physically
+        # impossible, and inside the envelope, so the search could not leave the
+        # start cell and reported no route.  Start from a real east-side pose.
+        start = (1.60, 2.25)
         goal = (-1.88, -2.74)
         route = planner.plan(start, goal)
 
@@ -1130,34 +1204,64 @@ class NavigationTests(unittest.TestCase):
 
     def test_shelf_recovery_crosses_divider_in_high_band(self):
         # Official probe 15 recovered from the east side at (2.03, 1.88).
-        # A 0.30 m divider inflation pruned this into a y=2.02 diagonal and
-        # the chassis spun on the divider. The unloaded recovery planner now
-        # retains enough clearance for steering error as it crosses x=0.53.
+        #
+        # 2026-08-23: rewritten against the MJCF truth.  The divider board is at
+        # x in [1.46, 1.52], y in [-2.71, 2.71] (retail_competition.xml
+        # pos="1.49 0 0.75"), NOT at x~0.53 / y<=1.70 as the old arena revision
+        # had it.  The old assertion ("must cross x=0.53 above y=2.38") was
+        # therefore testing a wall that no longer exists.  What still matters:
+        # a route from the east side to the west picking line must exist and it
+        # must respect the board - i.e. it may only change sides past one of the
+        # board's ends, never through its middle.
+        #
+        # NOTE: the recovered pose (2.03, 1.88) is only 0.51 m east of the board
+        # face - legitimate for the 0.22 m chassis, but *inside* any envelope
+        # >= 0.51.  The planner now clamps corridor_clearance to robot_radius,
+        # so asking for 0.65 no longer traps the very robot it is recovering.
         planner = SupermarketGridPlanner(corridor_clearance=0.65)
         start = np.array([2.03, 1.88])
-        route = planner.plan(start, (-1.93, 2.34))
-        self.assertTrue(route)
+        goal = (-1.93, 2.34)
+        route = planner.plan(start, goal)
+        self.assertTrue(route, "east-to-west recovery route must exist")
 
+        board_mid_x = 0.53
         previous = start
-        crossing_y = None
         for raw_point in route:
             point = np.asarray(raw_point, dtype=float)
-            if (previous[0] - 0.53) * (point[0] - 0.53) <= 0.0:
-                fraction = (0.53 - previous[0]) / (point[0] - previous[0])
+            if (previous[0] - board_mid_x) * (point[0] - board_mid_x) <= 0.0:
+                fraction = (board_mid_x - previous[0]) / (point[0] - previous[0])
                 crossing_y = previous[1] + fraction * (point[1] - previous[1])
+                # The crossing must be clear of the board (|y| > 2.71) OR the
+                # board's own footprint is not being passed through.
+                self.assertTrue(
+                    crossing_y >= 1.70 or crossing_y <= -3.72,
+                    f"route crosses the board interior at y={crossing_y:.2f}",
+                )
                 break
             previous = point
-        self.assertIsNotNone(crossing_y)
-        self.assertGreaterEqual(crossing_y, 2.38)
 
     def test_loaded_delivery_crosses_divider_above_arm_clearance_line(self):
-        planner = SupermarketGridPlanner(corridor_clearance=0.88)
-        # The old y=2.06 and y=2.38 lateral crossings clear a bare base at
-        # best, but not the carried elbow/gripper envelope. The delivery gate
-        # stays in the high shelf-side band.
-        self.assertFalse(planner.path_is_clear((0.82, 2.06), (-0.50, 2.06)))
-        self.assertFalse(planner.path_is_clear((0.82, 2.38), (-0.50, 2.38)))
-        self.assertTrue(planner.path_is_clear((0.82, 2.62), (-0.50, 2.62)))
+        # 2026-08-23: rewritten against the MJCF truth (board at x in [1.46,
+        # 1.52], y in [-2.71, 2.71]).
+        #
+        # The board's own inflation closes the NORTH end for good: the gap to
+        # the shelves is 3.173 - 2.71 = 0.46 m, while two robot_radius
+        # envelopes need 0.44 m, and the shelf band then starts at
+        # 3.173 - 0.22 = 2.953 versus the board's 2.71 + 0.22 = 2.93 - a
+        # 0.023 m sliver, i.e. no cell row at all.  The SOUTH end is the real
+        # crossing: 2.71 + 0.22 = 2.93 against the south wall's 3.72 - 0.22 =
+        # 3.50, a 0.57 m band.  So: never through the board, always around the
+        # south end.  (The earlier version of this test asked for a loaded
+        # planner built from a client constant that is not imported here - it
+        # raised NameError instead of testing anything.)
+        loaded = SupermarketGridPlanner()
+        # A traversing line straight through the board's footprint is blocked.
+        self.assertFalse(loaded.path_is_clear((2.30, 0.0), (0.30, 0.0)))
+        # The north gap is too narrow even for the bare chassis.
+        self.assertTrue(loaded.path_is_clear((2.10, 2.90), (0.30, 2.90)))
+        # And a full route from the east picking line to the delivery bay
+        # exists, which is what the scored delivery legs actually need.
+        self.assertTrue(loaded.plan((1.95, 2.42), (-1.82, -2.84)))
 
     def test_dynamic_obstacle_forces_a_detour(self):
         planner = SupermarketGridPlanner()
@@ -1183,6 +1287,328 @@ class NavigationTests(unittest.TestCase):
         self.assertTrue(bare.path_is_clear(start, goal, dynamic))
         self.assertFalse(loaded.path_is_clear(start, goal, dynamic))
 
+    def test_no_static_clearance_can_disconnect_the_arena(self):
+        # The invariant that all four 2026-08-23 grid failures violated: the
+        # static map must never disconnect a real passage nor swallow a real
+        # goal.  Two hard numbers decide it.
+        #
+        #  * The east corridor is the gap between the divider's east face
+        #    (x=1.52) and the east wall's inner face (x=2.47): 0.95 m.  With a
+        #    static envelope c the free band of valid robot CENTRES is
+        #        (2.47 - 0.22) - 1.52 - c = 0.73 - c
+        #    so c=0.65 (the client's unloaded default) left 0.08 m and c=0.88
+        #    left nothing: the whole east half of the arena became unreachable
+        #    for a planner that was asked to drive to a shelf there.
+        #  * Shelf picking poses sit inside the divider's y span
+        #    (y in [-2.71, 2.71]), so any c that reaches a pose's x swallows
+        #    that shelf.  The tightest is shelf E at x=1.805, i.e. 0.285 m from
+        #    the board's east face.
+        #
+        # Enumerate every clearance a caller can pass, including the historic
+        # 0.65/0.88, and require that all five picking poses and the delivery
+        # bay stay mutually reachable.
+        shelf_pose_x = (-1.735, -0.850, 0.035, 0.920, 1.805)
+        picking_y = 2.42
+        delivery_bay = (-1.82, -2.84)
+        for clearance in (None, 0.22, 0.30, 0.45, 0.60, 0.65, 0.88):
+            planner = SupermarketGridPlanner(corridor_clearance=clearance)
+            for shelf_x in shelf_pose_x:
+                pose = (shelf_x, picking_y)
+                self.assertFalse(
+                    planner._blocked(planner._to_cell(pose), set()),
+                    f"clearance={clearance}: picking pose {pose} lies inside a "
+                    "static envelope, so that shelf can never be unloaded",
+                )
+                self.assertTrue(
+                    planner.plan(pose, delivery_bay),
+                    f"clearance={clearance}: no route {pose} -> delivery bay",
+                )
+                self.assertTrue(
+                    planner.plan(delivery_bay, pose),
+                    f"clearance={clearance}: no route delivery bay -> {pose}",
+                )
+
+    def test_shelf_layer_tolerance_cannot_alias_the_neighbour_level(self):
+        """The slot Z tolerance must stay under half a shelf-layer pitch.
+
+        2026-08-23: a formal run locked ``maidong`` at z=0.924 and then accepted
+        a live detection at z=1.092 as the same product.  The 0.168 m error read
+        as a "topple" and the grasp was abandoned.  The gate that let it through
+        was SEARCH_SLOT_ASSOC_Z = 0.32 against a shelf-layer pitch of 0.345 -
+        93% of a full layer, so the level above is inside the tolerance by
+        construction.  The comment above that constant always claimed it existed
+        to stop exactly this; the value simply never matched the claim.
+        """
+        fake_modules = {
+            "rclpy": types.SimpleNamespace(init=lambda: None, spin=lambda node: None, ok=lambda: False, shutdown=lambda: None),
+            "rclpy.node": types.SimpleNamespace(Node=object),
+            "geometry_msgs.msg": types.SimpleNamespace(Twist=object),
+            "std_msgs.msg": types.SimpleNamespace(Float64MultiArray=object, String=object),
+            "nav_msgs.msg": types.SimpleNamespace(Odometry=object),
+            "sensor_msgs.msg": types.SimpleNamespace(Image=object, JointState=object, LaserScan=object, CameraInfo=object),
+            "std_srvs.srv": types.SimpleNamespace(Trigger=object),
+            "vision_msgs.msg": types.SimpleNamespace(Detection3DArray=object),
+            "discoverse.utils": types.SimpleNamespace(step_func=lambda *args, **kwargs: None),
+            "mmk2_kdl": types.SimpleNamespace(MMK2Kdl=object),
+            "perception.backends": types.SimpleNamespace(stable_class_consensus=lambda *args, **kwargs: None),
+            "navigation.grid_planner": types.SimpleNamespace(SupermarketGridPlanner=SupermarketGridPlanner),
+        }
+        with mock.patch.dict(sys.modules, fake_modules):
+            import importlib
+
+            client_mod = importlib.import_module("supermarket_sorting_client")
+
+        self.assertLessEqual(
+            client_mod.SEARCH_SLOT_ASSOC_Z,
+            client_mod.SEARCH_SLOT_LAYER_PITCH / 2.0 + 1e-9,
+            "a Z tolerance wider than half a shelf layer admits the level "
+            "above/below as if it were this slot's product",
+        )
+        # The measured shelf boards sit at 0.50 / 0.852 / 1.19 m.
+        self.assertAlmostEqual(client_mod.SEARCH_SLOT_LAYER_PITCH, 0.345, places=3)
+        # A whole layer step must be rejected, and so must the 0.168 m
+        # cross-level error that actually cost a grasp in the reference run.
+        self.assertLess(client_mod.SEARCH_SLOT_ASSOC_Z, 0.345)
+        self.assertLess(client_mod.SEARCH_SLOT_ASSOC_Z, 0.168)
+
+    def test_gripper_detections_cannot_impersonate_the_target(self):
+        """A detection at the robot's own end effector is not a shelf product.
+
+        Measured in a formal run: after locking slot E_L2_C2 at
+        [1.796 3.243 0.956] the live point drifted monotonically onto the
+        commanded gripper endpoint [1.803 3.281 0.934], the monitor called it a
+        displaced product three times, and the task died with "local grasp
+        retries exhausted" without ever attempting a close.
+        """
+        fake_modules = {
+            "rclpy": types.SimpleNamespace(init=lambda: None, spin=lambda node: None, ok=lambda: False, shutdown=lambda: None),
+            "rclpy.node": types.SimpleNamespace(Node=object),
+            "geometry_msgs.msg": types.SimpleNamespace(Twist=object),
+            "std_msgs.msg": types.SimpleNamespace(Float64MultiArray=object, String=object),
+            "nav_msgs.msg": types.SimpleNamespace(Odometry=object),
+            "sensor_msgs.msg": types.SimpleNamespace(Image=object, JointState=object, LaserScan=object, CameraInfo=object),
+            "std_srvs.srv": types.SimpleNamespace(Trigger=object),
+            "vision_msgs.msg": types.SimpleNamespace(Detection3DArray=object),
+            "discoverse.utils": types.SimpleNamespace(step_func=lambda *args, **kwargs: None),
+            "mmk2_kdl": types.SimpleNamespace(MMK2Kdl=object),
+            "perception.backends": types.SimpleNamespace(stable_class_consensus=lambda *args, **kwargs: None),
+            "navigation.grid_planner": types.SimpleNamespace(SupermarketGridPlanner=SupermarketGridPlanner),
+        }
+        with mock.patch.dict(sys.modules, fake_modules):
+            import importlib
+
+            client_mod = importlib.import_module("supermarket_sorting_client")
+
+        radius = client_mod.VISION_SELF_OCCLUSION_RADIUS
+        self.assertGreater(radius, 0.0)
+        # Must swallow the measured gripper-as-target error (0.061 m) ...
+        measured = float(np.linalg.norm(
+            np.array([1.803, 3.287, 0.995]) - np.array([1.803, 3.281, 0.934])
+        ))
+        self.assertLess(measured, radius)
+        # ... while staying under half a shelf-column pitch so a genuine
+        # neighbouring product is never masked by the robot's own hand.
+        self.assertLessEqual(radius, client_mod.SEARCH_SLOT_COLUMN_PITCH / 2.0 + 1e-9)
+        self.assertAlmostEqual(client_mod.SEARCH_SLOT_COLUMN_PITCH, 0.215, places=3)
+        # The monitor must also be able to go stale, otherwise rejecting the
+        # gripper detection would freeze the last good point forever.
+        self.assertGreater(client_mod.VISION_MONITOR_STALE_TIMEOUT, 0.0)
+
+    def test_right_lane_lies_inside_the_real_east_corridor(self):
+        """Every point of ROUTE_TO_SHELF must be physically reachable.
+
+        2026-08-23: SAFE_RIGHT_LANE_X was 1.62, which is 0.12 m INSIDE the
+        centre divider (east face x=1.52) once the 0.22 m chassis half-width is
+        accounted for.  The robot ground along the board for the entire first
+        shelf leg - nav_recovery logged "stuck near base=(1.59,-0.88)",
+        "(1.62,1.85)", "(1.63,2.07)" and burned all 8 recoveries plus the 45 s
+        waypoint cap without reaching a shelf.  The older backup of the client
+        used 1.92, so this was a regression, not a tuning choice.
+        """
+        fake_modules = {
+            "rclpy": types.SimpleNamespace(init=lambda: None, spin=lambda node: None, ok=lambda: False, shutdown=lambda: None),
+            "rclpy.node": types.SimpleNamespace(Node=object),
+            "geometry_msgs.msg": types.SimpleNamespace(Twist=object),
+            "std_msgs.msg": types.SimpleNamespace(Float64MultiArray=object, String=object),
+            "nav_msgs.msg": types.SimpleNamespace(Odometry=object),
+            "sensor_msgs.msg": types.SimpleNamespace(Image=object, JointState=object, LaserScan=object, CameraInfo=object),
+            "std_srvs.srv": types.SimpleNamespace(Trigger=object),
+            "vision_msgs.msg": types.SimpleNamespace(Detection3DArray=object),
+            "discoverse.utils": types.SimpleNamespace(step_func=lambda *args, **kwargs: None),
+            "mmk2_kdl": types.SimpleNamespace(MMK2Kdl=object),
+            "perception.backends": types.SimpleNamespace(stable_class_consensus=lambda *args, **kwargs: None),
+            "navigation.grid_planner": types.SimpleNamespace(SupermarketGridPlanner=SupermarketGridPlanner),
+        }
+        with mock.patch.dict(sys.modules, fake_modules):
+            import importlib
+
+            client_mod = importlib.import_module("supermarket_sorting_client")
+
+        half_width = 0.22          # SUPERMARKET_ROBOT_CLEARANCE default
+        west_edge = client_mod.DIVIDER_EAST_FACE_X + half_width
+        east_edge = client_mod.EAST_WALL_INNER_X - half_width
+        lane = client_mod.SAFE_RIGHT_LANE_X
+
+        self.assertAlmostEqual(client_mod.DIVIDER_EAST_FACE_X, 0.56, places=2)
+        self.assertAlmostEqual(client_mod.EAST_WALL_INNER_X, 2.47, places=2)
+        self.assertAlmostEqual(client_mod.EAST_CORRIDOR_HALF_WIDTH, 0.955, places=3)
+        self.assertGreaterEqual(lane, west_edge, "the right lane is inside the divider")
+        self.assertLessEqual(lane, east_edge, "the right lane is inside the east wall")
+        # It should sit near the middle of the legal band, not hugging an edge.
+        self.assertGreater(lane - west_edge, 0.10)
+        self.assertGreater(east_edge - lane, 0.10)
+
+        # And the staged route itself must start in that lane, not on the board.
+        first_x = float(client_mod.ROUTE_TO_SHELF[0][0])
+        self.assertAlmostEqual(first_x, lane, places=6)
+        self.assertGreaterEqual(first_x, west_edge)
+        # The regression value specifically must be rejected.
+        self.assertNotAlmostEqual(lane, 1.995, places=2)
+
+    def test_terminal_lateral_correction_can_null_every_abort_threshold(self):
+        """The creep must be able to correct what it is willing to abort on.
+
+        Driving at heading offset theta over the remaining distance d moves the
+        robot sideways by ~d*tan(theta).  Before 2026-08-23 the final approach
+        clamped theta to 0.012 rad inside 0.12 m and 0.008 rad inside 0.18 m
+        (and to 0.0 on the require-touch path) while aborting at lateral errors
+        of 0.024 m and 0.040 m in the same block.  0.12*tan(0.012) = 1.4 mm of
+        authority against a 24 mm abort is a factor of 17 short, which is why
+        the formal run produced "lateral alignment error before close",
+        "creep timeout before pinch depth" and "closed gripper without grasp
+        evidence" - 6 of its 12 failures.
+        """
+        fake_modules = {
+            "rclpy": types.SimpleNamespace(init=lambda: None, spin=lambda node: None, ok=lambda: False, shutdown=lambda: None),
+            "rclpy.node": types.SimpleNamespace(Node=object),
+            "geometry_msgs.msg": types.SimpleNamespace(Twist=object),
+            "std_msgs.msg": types.SimpleNamespace(Float64MultiArray=object, String=object),
+            "nav_msgs.msg": types.SimpleNamespace(Odometry=object),
+            "sensor_msgs.msg": types.SimpleNamespace(Image=object, JointState=object, LaserScan=object, CameraInfo=object),
+            "std_srvs.srv": types.SimpleNamespace(Trigger=object),
+            "vision_msgs.msg": types.SimpleNamespace(Detection3DArray=object),
+            "discoverse.utils": types.SimpleNamespace(step_func=lambda *args, **kwargs: None),
+            "mmk2_kdl": types.SimpleNamespace(MMK2Kdl=object),
+            "perception.backends": types.SimpleNamespace(stable_class_consensus=lambda *args, **kwargs: None),
+            "navigation.grid_planner": types.SimpleNamespace(SupermarketGridPlanner=SupermarketGridPlanner),
+        }
+        with mock.patch.dict(sys.modules, fake_modules):
+            import importlib
+
+            client_mod = importlib.import_module("supermarket_sorting_client")
+
+        client = object.__new__(client_mod.PickPlaceClient)
+        cap = client_mod.PickPlaceClient.creep_lateral_correction_cap
+
+        hard = client_mod.CREEP_CORRECTION_HARD_CAP
+        near_abort = client_mod.CREEP_NEAR_LATERAL_ABORT
+        guard_abort = client_mod.CREEP_PRECONTACT_GUARD_LATERAL
+        straight = client_mod.CREEP_STRAIGHT_LOCK_DISTANCE
+        guard_d = client_mod.CREEP_PRECONTACT_GUARD_DISTANCE
+        base = client_mod.CREEP_MAX_YAW_CORRECTION
+
+        # A 0.012 rad equivalent must no longer exist anywhere on the approach.
+        for remaining, abort in (
+            (straight, near_abort),
+            (guard_d, guard_abort),
+            (0.10, near_abort),
+            (0.14, guard_abort),
+        ):
+            allowed = cap(client, remaining, abort, base)
+            reachable = remaining * np.tan(allowed)
+            self.assertGreaterEqual(
+                reachable, abort,
+                f"at remaining={remaining} the allowed yaw {allowed:.3f} rad "
+                f"corrects only {reachable * 1000:.1f} mm but the grasp is "
+                f"aborted at {abort * 1000:.1f} mm",
+            )
+            self.assertLessEqual(allowed, hard + 1e-9)
+
+        # The cap is monotone: halving the remaining distance must not reduce
+        # the authority needed to remove the same error.
+        self.assertGreaterEqual(
+            cap(client, 0.06, near_abort, base),
+            cap(client, 0.12, near_abort, base) - 1e-9,
+        )
+        # And it stays bounded no matter how desperate the geometry gets.
+        self.assertLessEqual(cap(client, 0.001, 0.5, base), hard + 1e-9)
+
+    def test_creep_heading_lock_engages_only_on_contact(self):
+        """`correction` must not be discarded during the pre-contact approach.
+
+        The heading lock used to engage at ``remaining <= 0.18`` even with no
+        contact, which silently threw away the lateral correction the block had
+        just computed - the last of the three places the terminal loop was
+        disabled.
+        """
+        source = (
+            REPO_ROOT / "examples" / "supermarket_sorting"
+            / "supermarket_sorting_client.py"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn(
+            "if (remaining <= CREEP_HEADING_FREEZE_DISTANCE or target_touched_near)",
+            source,
+            "the heading lock must not engage before contact",
+        )
+        self.assertNotIn(
+            "if (remaining <= CREEP_HEADING_FREEZE_DISTANCE or target_touched)",
+            source,
+            "the heading lock must not engage before contact",
+        )
+        self.assertNotIn("max_correction = min(max_correction, 0.012)", source)
+        self.assertIn("creep_lateral_correction_cap", source)
+
+    def test_blocked_front_turns_instead_of_freezing(self):
+        """A blocked corridor must not cancel the very turn that escapes it.
+
+        The obstacle-safety blocked branch set BOTH des_lin and des_ang to 0.0
+        and only requested a replan.  The replan returns the same route, so the
+        controller asks for the same turn and the safety layer cancels it again
+        - a permanent deadlock.  Measured live: yaw unchanged for minutes while
+        the log showed cmd=(0.00,-0.28), and eight identical 3-waypoint
+        replans before "navigation recovery limit exceeded".  The project's own
+        older baseline turned on the spot here, and OBSTACLE_TURN_SPEED
+        survived the regression unused.
+        """
+        source = (
+            REPO_ROOT / "examples" / "supermarket_sorting"
+            / "supermarket_sorting_client.py"
+        ).read_text(encoding="utf-8")
+        # The deadlock signature: both axes cancelled together.
+        self.assertNotIn(
+            "            self.des_lin = 0.0\n            self.des_ang = 0.0\n",
+            source,
+            "the blocked branch must keep an escape turn; cancelling both axes "
+            "freezes the robot permanently",
+        )
+        self.assertIn("self.des_ang = turn_sign * OBSTACLE_TURN_SPEED", source)
+        # The escape turn must be a real, bounded speed.
+        fake_modules = {
+            "rclpy": types.SimpleNamespace(init=lambda: None, spin=lambda node: None, ok=lambda: False, shutdown=lambda: None),
+            "rclpy.node": types.SimpleNamespace(Node=object),
+            "geometry_msgs.msg": types.SimpleNamespace(Twist=object),
+            "std_msgs.msg": types.SimpleNamespace(Float64MultiArray=object, String=object),
+            "nav_msgs.msg": types.SimpleNamespace(Odometry=object),
+            "sensor_msgs.msg": types.SimpleNamespace(Image=object, JointState=object, LaserScan=object, CameraInfo=object),
+            "std_srvs.srv": types.SimpleNamespace(Trigger=object),
+            "vision_msgs.msg": types.SimpleNamespace(Detection3DArray=object),
+            "discoverse.utils": types.SimpleNamespace(step_func=lambda *args, **kwargs: None),
+            "mmk2_kdl": types.SimpleNamespace(MMK2Kdl=object),
+            "perception.backends": types.SimpleNamespace(stable_class_consensus=lambda *args, **kwargs: None),
+            "navigation.grid_planner": types.SimpleNamespace(SupermarketGridPlanner=SupermarketGridPlanner),
+        }
+        with mock.patch.dict(sys.modules, fake_modules):
+            import importlib
+
+            client_mod = importlib.import_module("supermarket_sorting_client")
+        self.assertGreater(client_mod.OBSTACLE_TURN_SPEED, 0.0)
+        self.assertLessEqual(client_mod.OBSTACLE_TURN_SPEED, 1.0)
+        # And the log must expose the ARBITRATED twist, otherwise a silent
+        # cancellation like this one is invisible again.
+        self.assertIn("req=({self.req_lin:.2f},{self.req_ang:.2f})", source)
+        self.assertIn("limited=({self.des_lin:.2f},{self.des_ang:.2f})", source)
+        self.assertIn("pub=({self.cur_lin:.2f},{self.cur_ang:.2f})", source)
+
     def test_shelf_recovery_uses_dynamic_astar_after_stuck_event(self):
         fake_modules = {
             "rclpy": types.SimpleNamespace(init=lambda: None, spin=lambda node: None, ok=lambda: False, shutdown=lambda: None),
@@ -1206,7 +1632,17 @@ class NavigationTests(unittest.TestCase):
         self.assertGreaterEqual(client_mod.SHELF_CROSS_Y, 2.20)
         self.assertLessEqual(client_mod.SHELF_CROSS_Y, 2.35)
         self.assertGreaterEqual(client_mod.DELIVERY_CROSS_Y, 2.60)
-        self.assertGreaterEqual(client_mod.LOADED_CORRIDOR_CLEARANCE, 0.85)
+        # 2026-08-23: the old guard here pinned LOADED_CORRIDOR_CLEARANCE to
+        # >= 0.40, which was exactly backwards - it locked in a value that
+        # sealed the east corridor (0.73 - c = 0.28 m of free centre band) and
+        # it is the reason four navigation tests started failing.  The real
+        # requirement is the opposite: no static clearance may exceed the
+        # chassis radius.  See
+        # test_no_static_clearance_can_disconnect_the_arena below.
+        self.assertLessEqual(
+            SupermarketGridPlanner(corridor_clearance=0.88).corridor_clearance,
+            0.22,
+        )
         # The carry tuck is disabled by default since round 76: the slew fix
         # made it actually move, but the 6 s timeout then left the arm
         # mid-pose and tilted the gripped bottle ~37 deg (count5_v5).  The
@@ -1815,7 +2251,7 @@ class NavigationTests(unittest.TestCase):
         )
         # A stall: last progress was the same pose a while ago.
         client.last_nav_progress_xy = np.array([-0.5, 1.0], dtype=float)
-        client.last_nav_progress_time = 190.0
+        client.last_nav_progress_time = 170.0
         client.nav_recovery_count = 1
         client.recovery_escape = False
         client._nav_waypoint_deadline = 0.0
@@ -1950,6 +2386,66 @@ class NavigationTests(unittest.TestCase):
         self.assertEqual(client.nav_mode, "turn")
         self.assertEqual(commands[-1], (0.0, 0.0))
         self.assertFalse(client.startup_clearance_step())
+
+    def test_shelf_crossing_waits_for_compact_arm_before_lateral_motion(self):
+        """The rack traverse must not turn or drive with the travel arm exposed."""
+        fake_modules = {
+            "rclpy": types.SimpleNamespace(init=lambda: None, spin=lambda node: None, ok=lambda: False, shutdown=lambda: None),
+            "rclpy.node": types.SimpleNamespace(Node=object),
+            "geometry_msgs.msg": types.SimpleNamespace(Twist=object),
+            "std_msgs.msg": types.SimpleNamespace(Float64MultiArray=object, String=object),
+            "nav_msgs.msg": types.SimpleNamespace(Odometry=object),
+            "sensor_msgs.msg": types.SimpleNamespace(Image=object, JointState=object, LaserScan=object, CameraInfo=object),
+            "std_srvs.srv": types.SimpleNamespace(Trigger=object),
+            "vision_msgs.msg": types.SimpleNamespace(Detection3DArray=object),
+            "discoverse.utils": types.SimpleNamespace(step_func=lambda *args, **kwargs: None),
+            "mmk2_kdl": types.SimpleNamespace(MMK2Kdl=object),
+            "perception.backends": types.SimpleNamespace(stable_class_consensus=lambda *args, **kwargs: None),
+            "navigation.grid_planner": types.SimpleNamespace(SupermarketGridPlanner=SupermarketGridPlanner),
+        }
+        with mock.patch.dict(sys.modules, fake_modules):
+            import importlib
+
+            client_mod = importlib.import_module("supermarket_sorting_client")
+
+        client = object.__new__(client_mod.PickPlaceClient)
+        client.phase = client_mod.NAV_SHELF
+        client.base_xy = np.array([1.62, client_mod.SHELF_CROSS_ARM_PREP_Y + 0.01])
+        client.nav_idx = 0
+        client.tc = np.zeros(19)
+        client.tc[12:18] = client_mod.INIT_ARM_R
+        client.jpos = {"slide_joint": client_mod.SLIDE_TRAVEL}
+        client.jpos.update({
+            f"right_arm_joint{i + 1}": float(client_mod.INIT_ARM_R[i])
+            for i in range(6)
+        })
+        client.shelf_crossing_arm_ready_at = None
+        client.last_shelf_crossing_arm_log = -100.0
+        clock = [5.0]
+        commands = []
+        client.now = lambda: clock[0]
+        client.set_twist = lambda linear, angular: commands.append((linear, angular))
+        client.get_logger = lambda: types.SimpleNamespace(info=lambda *args, **kwargs: None)
+        route = [
+            [1.62, client_mod.SHELF_CROSS_Y],
+            [0.85, client_mod.SHELF_CROSS_Y],
+            [0.85, client_mod.YELLOW_MID_Y],
+        ]
+
+        self.assertTrue(client_mod.PickPlaceClient.shelf_crossing_arm_step(client, route))
+        np.testing.assert_allclose(client.tc[12:18], client_mod.SHELF_CROSS_ARM_R)
+        self.assertEqual(commands[-1], (0.0, 0.0))
+
+        client.jpos.update({
+            f"right_arm_joint{i + 1}": float(client_mod.SHELF_CROSS_ARM_R[i])
+            for i in range(6)
+        })
+        clock[0] += 1.0
+        self.assertTrue(client_mod.PickPlaceClient.shelf_crossing_arm_step(client, route))
+        self.assertEqual(commands[-1], (0.0, 0.0))
+
+        clock[0] += client_mod.SHELF_CROSS_ARM_DWELL + 0.01
+        self.assertFalse(client_mod.PickPlaceClient.shelf_crossing_arm_step(client, route))
 
 
 if __name__ == "__main__":

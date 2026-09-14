@@ -1764,3 +1764,171 @@ python -m unittest discover -s examples/supermarket_sorting/tests -p "test_*.py"
 - 待排查：感知节点 pixel_to_cam + T_cam_world 的深度标定（z 偏差来源）；
   以及随机化时 aruco 关联是否可靠。这影响正式匿名任务能否正确锁定目标。
 - 已提交：SEARCH_DETECT_TIMEOUT 修复（Round 61e）。
+
+---
+
+# 2026-08-22 补充：匿名搜索锁定链路修复（PR6 / PR6b / PR6c）
+
+## 一、背景与问题定位（本轮实测验证）
+
+正式匿名模式（SUPERMARKET_TASK_ANONYMOUS=1 + YOLO 九类检测）下，所有槽位搜索
+一律报 `vision target timeout during deploy; anonymous search candidate was not
+visually locked`，5 单全失败（failed_count 一路涨到 20+，finished_count 恒为 0）。
+
+通过容器内实时探针（slide 与 YOLO 检出数逐帧联动、head_pitch 扫描、ArUco 检出对比、
+相机位姿 FK 投影）定位出三层根因，逐层修复：
+
+### 根因 1（PR6）：搜索锁定阶段机械臂挡住头部相机
+锁定阶段决策端把 slide 直接伸到 grasp_slide（0.30+），机械臂正好挡在头部相机
+（z≈1.54m）与货架之间。实测：slide>=0.3 时 YOLO 每帧检出 0；slide<=0.03 时稳定
+检出 4~9 个商品（zhijin/pingguo 等，置信度 0.9+）。
+
+### 根因 2（PR6b）：HEAD_PITCH=-0.6 俯视导致相机只看到货架板顶面
+锁定阶段无条件 `tc[4]=HEAD_PITCH`（-0.6 rad ≈ 下俯 34°）。从 1.57m 头高看，
+这个角度视线越过货架板前沿、落在板顶面上：正面贴的 ArUco 标签被透视压缩到不可检
+出、商品只见盒顶。实测：pitch≈0（水平）时单帧检出 2 个 ArUco 标签（id=8 22px、
+id=17 11px）+ 多个 YOLO 商品；pitch=-0.6 时两者全 0。
+
+### 根因 3（PR6c）：tissue_top_pinch 抓取阶段同样被 -0.6 锁死
+PR6b 修好后搜索锁定已可成功（实测 `[inventory] accepted 1 ArUco-bound observations`，
+search_07 槽位绑定 zhijin，grasp_strategy 切换为 front_short_axis_box_clamp），但
+tissue 抓取状态机在锁定阶段又把 head 设回 HEAD_PITCH=-0.6，导致
+`apply_fresh_grasp_observation` 永远等不到 3 帧 ArUco 观测，报
+`tissue top pinch could not lock target`。
+
+## 二、代码修改（examples/supermarket_sorting/supermarket_sorting_client.py）
+
+1. 新增常量 `SEARCH_LOCK_SLIDE=0.03`（可通过 SUPERMARKET_SEARCH_LOCK_SLIDE 覆盖）：
+   搜索锁定阶段 slide 保持收起，目标锁定成功后才伸到 grasp_slide 部署。
+2. 新增常量 `SEARCH_OBSERVE_PITCH_BY_LEVEL`（L1:-0.38 / L2:-0.18 / L3:-0.06，
+   兜底 -0.18）：搜索观察时按槽位层级设置 head pitch，让货架正面（标签+商品正面）
+   保持在相机视野内；原 HEAD_PITCH=-0.6 只在非搜索任务使用。
+3. deploy 锁定分支：搜索模式用 SEARCH_LOCK_SLIDE + 按层 pitch；锁定成功后
+   `tc[2]=grasp_slide` 再走 arm_to_reachable_deploy。
+4. tick_tissue_top_pinch：未锁定时 head 用按层观察 pitch，锁定后才回到 HEAD_PITCH。
+
+## 三、验证结果
+
+- 88 项单元测试全部通过（含 cartesian_path、ArUco 关联、PR3/PR4/PR5 系列回归）。
+- 编译通过；restart 脚本以官方镜像 + seed 11 + YOLO 匿名模式实测：
+  - 修复前：全部槽位 `vision target timeout`，finished_count=0。
+  - 修复后：search_07（A_L3_C3）成功 `[inventory] accepted 1 ArUco-bound
+    observations` 并绑定 zhijin、切换 tissue 抓取策略；搜索锁定链路打通。
+- 遗留（下一步，本次未完成）：L1/L2 层槽位标签从当前站位（导航 y≈2.34~2.47、
+  相机 1.57m）仍检不出 ArUco（实测任意 pitch 0~-1.1 均只有 L3 层 id=8/17 可检出），
+  需验证"更近观察站位（shelf_nav_y 前推）"或"相机高度随 slide 变化"假设；
+  tissue_top_pinch 完整抓取流程（S2 双指接触 + S3 位移 + 配送）待多 seed 回归。
+
+---
+
+# 2026-08-22 补充（第二轮）：匿名搜索锁定彻底打通（PR7 / PR7b / PR7c）
+
+## 背景
+PR6b 后搜索锁定只在 L3 层槽位偶发成功（ArUco 标签贴近相机高度可解码），
+L1/L2 层槽位永远 `vision target timeout`：标签贴在货架板前沿、相机 1.57m 高
+需 40-50° 深俯角，板前沿挡住标签下半导致 ArUco 解码失败（实测任意 pitch
+0~-1.1 只有 L3 层 id=8/17 可检出）。
+
+## 根因（本轮实测确认）
+1. **决策子类 det_cb 在搜索模式完全短路**：只收 schema-v3 ArUco 观测，
+   YOLO 裸检测（已含 search_slot_world 槽位关联 + 类共识）被丢弃 →
+   L1/L2 无 ArUco 时永远锁不定。
+2. **YOLO world 是商品表面点**：直接 lock 会导致 tissue_top 网关目标
+   z 虚高（表面 z + pre_z + slide）超出 IK 包络（实测 z=1.258→网关 1.958 不可达）。
+3. **YOLO world 需夹取到固定 ArUco 槽位**（槽位 Y + 层级融合 Z），与
+   schema-v3 路径一致，否则 tissue IK 与导航站位失配。
+
+## 修改（decision/supermarket_sorting_decision_client.py）
+1. **PR7**：搜索模式 det_cb 不再短路，放行 base 类（YOLO 检出经
+   search_slot_world 关联 + stable_class_consensus + bind_detected_search_product）。
+2. **PR7**：_lock_target 的 fresh_grasp（ArUco）失败时回退
+   `_lock_search_via_det_buf()`（det_buf 锁定），L1/L2 不再死等 ArUco。
+3. **PR7b**：det_buf 锁定不做 surface_to_center_z 二次上移（避免网关 z 越界），
+   只保留 XY 前向修正。
+4. **PR7c**：det_buf 锁定把 X 用视觉、Y/Z 夹取到固定槽位
+   （slot_by_aruco → world_position），与 ArUco fresh_grasp 语义一致。
+5. 补 import：DETECT_MIN_SAMPLES、VISION_SURFACE_TO_CENTER_FWD。
+
+## 验证（官方镜像 seed 11 + YOLO 匿名）
+- 88 项单元测试全绿。
+- 搜索锁定：L1/L2/L3 槽位均成功
+  `[fresh_grasp] locked search slot via generic detections (ArUco occluded)`，
+  锁定 world 与 runtime_layout 真值吻合
+  （例：A_L1_C1 锁定 [-1.908, 3.243, 0.548] vs 真值 [-1.955, 3.243, 0.5484]）。
+- tissue_top 状态机推进到 stage 2（降脊柱），不再卡在 stage 0 网关 IK。
+- 遗留：tissue 抓取执行阶段（L1 层 `lowering did not settle`、L3 层后续流程）
+  与完整 5 单配送仍需下一轮多 seed 回归。
+
+---
+
+# 2026-08-23 第三轮：搜索锁定稳定 + tissue 抓取推进（PR7~PR13）
+
+## 已解决：搜索锁定全层打通（此前只 L3 偶发成功）
+1. **PR7**（decision/supermarket_sorting_decision_client.py）：搜索模式 det_cb 不再
+   短路，放行 base 类 YOLO 检出（search_slot_world 关联 + 类共识 + bind）；新增
+   `_lock_search_via_det_buf()` 作为 ArUco fresh_grasp 的回退锁定。
+2. **PR7b/7c**：det_buf 锁定不做 surface_to_center_z 二次上移；X 用视觉、Y/Z 夹取
+   到固定 ArUco 槽位（slot_by_aruco → world_position），与 schema-v3 语义一致。
+   实测锁定 world 与 runtime_layout 真值吻合（L1 锁定 [-1.908,3.243,0.548] vs
+   真值 [-1.955,3.243,0.5484]）。
+3. **PR8**：搜索关联 Y 阈值 0.18→0.60（白色 zhijin depth 误差 0.3-0.45m）、
+   Z 阈值 0.20→0.32（容纳 depth 误差 0.31 且不跨层 0.345）。
+
+## 已解决：tissue_top 推进到 stage 4（gateway/insertion 全通）
+4. **PR9**：tissue_top 的 base_slide 回退到按层 grasp_slide（删除硬编码 0.500）。
+5. **PR10**：L2/L1 zhijin 用 shelf_nav_y=2.68（对齐团队离线 0.6m envelope）。
+6. **PR11**：bind_search_task_product 更新 navigation_target（standoff 计算）+
+   设 inventory_confirmed=True；client bind 后触发 bounded re-park 重新导航。
+7. **PR12**：tissue Cartesian 路径 max_joint_step 0.30→0.45（团队离线探测值）。
+8. **PR13**：descent 连续路径失败时回退单点 arm_to。
+
+## 当前卡点：tissue_top descent（垂直下降）在 L3 物理不可达
+- L2/L3 都能推进到 stage 4（descending），但 L3 的 grasp 点（centre+0.06，
+  slide=-0.030 脊柱最高 + base_x_bias 侧向 0.074m）物理执行 24s 未 settle。
+- 团队离线探测（probe_tissue_vertical_top/inverted_top）只验证了 **L2 高度 +
+  slide 0.20 + fp[1]=0（无侧向）**；L3 的 slide=-0.030 + 侧向 offset 组合从未
+  离线验证，是完整流程下暴露的新几何盲区。
+- 下一步：对 L3（及 L2 侧向）做离线 KDL 网格（slide × centre_x × lateral），
+  找 descent+extraction 全通组合，再回填 profile；这是团队 79 轮同级别的工作。
+
+## 回归
+- 88 项单元测试全绿（含 L3 grasp_slide=-0.030 断言）。
+
+---
+
+# 2026-08-23 第四轮：锁定兜底修复 + L3 descent 根因定位（PR15）
+
+## 线上实测（官方匿名 5 单：sanmingzhi/heweidao/shupian/zhijin/maidong）
+- **search_00（L2_C1 zhijin）**：搜索绑定成功，但进入 tissue_top 抓取阶段后
+  `active=zhijin buf=0/3 assoc_reject:56/56`，10s 后 `tissue top pinch could not lock
+  target`，重试同失败 → 该 slot 报废。
+- **search_01（L3_C1 zhijin）**：YOLO 深度碰巧有效，锁定成功（`samples=13`），
+  gateway ✓ → insertion ✓（17 waypoints）→ descent 连续路径 `fraction=0.36
+  waypoint 6/14` 被拒 → PR13 单点 arm_to 回退 ✓ → `descending` 24s 不 settle → 失败。
+
+## 根因 A（已修 PR15）：搜索绑定后的抓取锁定被"紧阈值 + 关闭的兜底"双重卡死
+- 绑定成功后 `expected_object_world` 被设为槽位世界坐标，base det_cb 于是走
+  `expected_object_world` 的**紧阈值**（TARGET_ASSOC_Y=0.16 / Z=0.30）而非搜索松阈值
+  （SEARCH_SLOT_ASSOC_Y=0.60 / Z=0.32）。
+- 白色 zhijin 的 RGB-D depth 系统性偏 0.3~0.44m（dy）、0.31m（dz）→ 全部被拒，
+  det_buf 恒 0/3。
+- 而兜底 `lock_inventory_geometry_fallback`（直接锁已确认槽位）默认被
+  `SUPERMARKET_INVENTORY_GEOMETRY_FALLBACK=0` 关死 → 锁定必失败。
+- **PR15**：`INVENTORY_GEOMETRY_FALLBACK` 默认 0→1（代码 + Dockerfile）。该方法本身已
+  被 `active_search_mode() + inventory_confirmed + 无接触` 三重门禁，只影响匿名搜索，
+  不影响 dev/stress/GT 路径。88 测试全绿。
+
+## 根因 B（未修，已定位）：L3 descent 失败是 IK 分支/种子传播，不是几何不可达
+- 新增 `scripts/probe_tissue_l3_descent.py`，用**实际代码的** tissue_top_rotation
+  `[[0,1,0],[1,0,0],[0,0,-1]]` + grasp_z=0.060 + pre_z=0.200 + pull=0.240 做网格。
+- 结果：L3 线上失败组合 `slide=-0.030 x=0.574 lat=0.078` 的 descent=1.00 /
+  extraction=1.00，**全部可达**；仅 x=0.66 且 slide∈{0.10,0.20} 进入 KDL 死区。
+- 结论：descent 失败是因为"网关→插入"这条链把手臂带到某个 IK 分支，从该分支垂直
+  下降不连续（waypoint 6/14），PR13 的 arm_to 又就近选了物理难到达的解。
+- 注意：旧 `probe_tissue_vertical_top.py` 仍用旧旋转矩阵 + grasp_z=-0.005，与线上
+  代码不一致，其"L2 全路径成功"结论不能直接套用当前 tissue_top。
+
+## 下一步（descent 修复方向）
+- 让 descent 在连续路径失败时，从 canonical seed 重解"above"姿态并重规划
+  insertion+descent（而非 PR13 单点 arm_to），保证落在可连续下降的分支上。
+- 或对 L3 重新离线验证（slide × centre_x × lateral 全网格 + 物理 settle 判定）。

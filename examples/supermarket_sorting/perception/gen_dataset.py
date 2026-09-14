@@ -115,18 +115,26 @@ def _resolve_background_ply():
     return "shentoon/dummy_background.ply"
 
 
-def build_sim():
-    """Build an MMK2Base with the GS renderer on (no ROS)."""
+def build_sim(use_gs=True):
+    """Build an MMK2Base with the renderer selectable (no ROS).
+
+    ``use_gs=False`` selects the plain MuJoCo rasteriser - the configuration
+    ``scripts/run_v2_official_test.sh`` actually runs (SUPERMARKET_USE_GS).  The
+    two renderers produce very different images (mean luma ~105 with 3DGS vs
+    ~190-225 rasterised), so a detector trained on only one of them is blind on
+    the other.
+    """
     cfg = MMK2Cfg()
     cfg.mjcf_file_path = _write_runtime_xml()
-    cfg.use_gaussian_renderer = True
+    cfg.use_gaussian_renderer = bool(use_gs)
     cfg.enable_render = True
     cfg.headless = True
 
     layout = json.loads(LAYOUT_JSON.read_text())
     cfg.obj_list = [slot["body"] for slot in layout]
     cfg.gs_model_dict = _local_robot_gs_model_dict()
-    cfg.gs_model_dict["background"] = _resolve_background_ply()
+    if use_gs:
+        cfg.gs_model_dict["background"] = _resolve_background_ply()
     for slot in layout:
         cfg.gs_model_dict[slot["body"]] = slot["gs_ply"]
 
@@ -481,6 +489,16 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--classes", default="all",
                     help="comma-separated official classes, or all")
+    # 2026-08-23 (audit): the dataset was 3DGS-only while the formal runner
+    # rendered with the plain MuJoCo rasteriser, so the shipped checkpoint was
+    # blind on every formal run.  Measured with scripts/probe_yolo_live_pose.py
+    # (same slot, same pose, shipping checkpoint): 8/10 correct with 3DGS on,
+    # 0/10 with it off, where the model answers "zhijin" at conf 0.93-1.00 for
+    # every input.  Rendering BOTH domains into one dataset costs one extra
+    # render pass per pose and makes the detector independent of whichever
+    # renderer the grading image happens to use.
+    ap.add_argument("--use-gs", default="both", choices=["0", "1", "both"],
+                    help="which renderer(s) to sample: 3DGS, MuJoCo rasteriser, or both")
     ap.add_argument("--overwrite", action="store_true",
                     help="allow replacing an existing output directory")
     ap.add_argument("--debug-overlay", action="store_true",
@@ -517,59 +535,74 @@ def main():
     if args.debug_overlay:
         (out_dir / "debug").mkdir(parents=True, exist_ok=True)
 
-    sim = build_sim()
     K = head_cam_K()
     layout = json.loads(LAYOUT_JSON.read_text())
     slots = [s for s in layout if s.get("object_kind") in selected_names]
     background_ply = _resolve_background_ply()
+    renderers = {"1": (True,), "0": (False,), "both": (True, False)}[args.use_gs]
     print(f"[gen] {len(slots)} slots; classes={selected_names}; rendering {args.frames} frames "
           f"x (1 + {args.variants}) variants, pose={args.pose_mode}, "
-          f"labels={args.label_mode}, background={background_ply}")
+          f"labels={args.label_mode}, renderers={renderers}")
 
     n_frames = 0
     n_boxes = 0
     n_imgs = 0
-    attempts = 0
-    max_attempts = args.frames * 4
     class_counts = {name: 0 for name in selected_names}
-    while n_frames < args.frames and attempts < max_attempts:
-        attempts += 1
-        base_xy, yaw, slide, pitch = sample_pose(rng, args.pose_mode)
-        set_robot_pose(sim, base_xy, yaw, slide, pitch)
-        sim.render()
-        rgb = sim.img_rgb_obs_s[HEAD_CAM_ID]              # uint8 HxWx3, RGB
-        depth_m = sim.img_depth_obs_s[HEAD_CAM_ID]        # float, metres
-        T_cw = T_cam_world(sim)
-        if args.label_mode == "mask":
-            boxes = label_objects(rgb, depth_m, K, T_cw, slots)
-        else:
-            boxes = label_projected(sim, depth_m, K, T_cw, slots)
-        if not boxes:
-            continue
+    # One renderer at a time: each sim loads every product's 3DGS ply, so two
+    # live sims would roughly double the GPU footprint for no benefit.
+    for renderer_index, use_gs in enumerate(renderers):
+        tag = "gs1" if use_gs else "gs0"
+        remaining_frames = args.frames - n_frames
+        remaining_renderers = len(renderers) - renderer_index
+        target_frames = -(-remaining_frames // remaining_renderers)   # ceil
+        if target_frames <= 0:
+            break
+        print(f"[gen] renderer {tag}: target {target_frames} frames "
+              f"({'3DGS' if use_gs else 'MuJoCo rasteriser'})")
+        sim = build_sim(use_gs)
+        attempts = 0
+        max_attempts = target_frames * 4
+        made = 0
+        while made < target_frames and attempts < max_attempts:
+            attempts += 1
+            base_xy, yaw, slide, pitch = sample_pose(rng, args.pose_mode)
+            set_robot_pose(sim, base_xy, yaw, slide, pitch)
+            sim.render()
+            rgb = sim.img_rgb_obs_s[HEAD_CAM_ID]              # uint8 HxWx3, RGB
+            depth_m = sim.img_depth_obs_s[HEAD_CAM_ID]        # float, metres
+            T_cw = T_cam_world(sim)
+            if args.label_mode == "mask":
+                boxes = label_objects(rgb, depth_m, K, T_cw, slots)
+            else:
+                boxes = label_projected(sim, depth_m, K, T_cw, slots)
+            if not boxes:
+                continue
 
-        rgb_bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-        split = "val" if rng.random() < args.val_frac else "train"
-        base_name = f"f{n_frames:04d}"
+            rgb_bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+            split = "val" if rng.random() < args.val_frac else "train"
+            base_name = f"f{n_frames:04d}_{tag}"
 
-        variants = [rgb_bgr] + domain_randomise(rng, rgb_bgr, args.variants)
-        for vi, img in enumerate(variants):
-            save_sample(out_dir, split, f"{base_name}_v{vi}", img, boxes)
-            n_imgs += 1
-        if args.debug_overlay:
-            dbg = rgb_bgr.copy()
-            for class_id, x0, y0, x1, y1 in boxes:
-                cv2.rectangle(dbg, (x0, y0), (x1, y1), (0, 255, 0), 2)
-                cv2.putText(dbg, PRODUCT_NAMES[class_id], (x0, max(12, y0 - 4)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
-            cv2.imwrite(str(out_dir / "debug" / f"{base_name}.jpg"), dbg)
+            variants = [rgb_bgr] + domain_randomise(rng, rgb_bgr, args.variants)
+            for vi, img in enumerate(variants):
+                save_sample(out_dir, split, f"{base_name}_v{vi}", img, boxes)
+                n_imgs += 1
+            if args.debug_overlay:
+                dbg = rgb_bgr.copy()
+                for class_id, x0, y0, x1, y1 in boxes:
+                    cv2.rectangle(dbg, (x0, y0), (x1, y1), (0, 255, 0), 2)
+                    cv2.putText(dbg, PRODUCT_NAMES[class_id], (x0, max(12, y0 - 4)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
+                cv2.imwrite(str(out_dir / "debug" / f"{base_name}.jpg"), dbg)
 
-        n_frames += 1
-        n_boxes += len(boxes)
-        for class_id, *_ in boxes:
-            class_counts[PRODUCT_NAMES[class_id]] += 1
-        if n_frames % 25 == 0:
-            print(f"[gen] {n_frames}/{args.frames} frames, {n_imgs} imgs, "
-                  f"{n_boxes} boxes")
+            n_frames += 1
+            made += 1
+            n_boxes += len(boxes)
+            for class_id, *_ in boxes:
+                class_counts[PRODUCT_NAMES[class_id]] += 1
+            if n_frames % 25 == 0:
+                print(f"[gen] {n_frames}/{args.frames} frames, {n_imgs} imgs, "
+                      f"{n_boxes} boxes")
+        del sim
 
     data_yaml = out_dir / "data.yaml"
     data_yaml.write_text(
