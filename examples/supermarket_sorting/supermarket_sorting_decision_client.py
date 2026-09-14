@@ -722,6 +722,16 @@ class DecisionPickPlaceClient(PickPlaceClient):
                     "may have moved" in reason
                     and self.active_target_knocked_or_dropped()
                 )
+                stale_or_skip_target = stale_or_skip_target or (
+                    (
+                        "local grasp retries exhausted" in reason
+                        or "closed gripper without grasp evidence" in reason
+                    )
+                    and (
+                        self.current_target_touched()
+                        or self.active_target_knocked_or_dropped()
+                    )
+                )
                 delivery_exhausted = reason.startswith("delivery navigation recovery limit exceeded")
                 # 2026-08-23: the tissue box gets exactly ONE attempt.  Its
                 # top-pinch sequence is a long, currently-unsolved manipulation

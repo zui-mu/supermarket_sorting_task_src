@@ -200,6 +200,9 @@ DIRECT_TASK_DETECT_TIMEOUT = float(
     os.getenv("SUPERMARKET_DIRECT_TASK_DETECT_TIMEOUT", "2.5")
 )
 TEST_ORACLE_ENABLED = os.getenv("SUPERMARKET_TEST_ORACLE", "0") == "1"
+GT_FAST_NAV = os.getenv("SUPERMARKET_GT_FAST_NAV", "0") == "1"
+GT_FAST_SHELF_POS_TOL = float(os.getenv("SUPERMARKET_GT_FAST_SHELF_POS_TOL", "0.032"))
+GT_FAST_FINAL_YAW_TOL = float(os.getenv("SUPERMARKET_GT_FAST_FINAL_YAW_TOL", "0.055"))
 REQUEST_SERVER_RESET = os.getenv("SUPERMARKET_REQUEST_SERVER_RESET", "0") == "1"
 # The public slot coordinate is useful only for the first, untouched attempt.
 # Once the fingers have closed or the referee reports contact, the object may
@@ -2427,6 +2430,16 @@ class PickPlaceClient(Node):
             self.fail_current_execution(
                 f"grasp failed at shelf: {reason}; target may have moved, skip this item")
             return
+        if (
+            self.test_oracle_enabled
+            and self.has_direct_official_target()
+            and self.current_target_touched()
+            and "closed gripper without grasp evidence" in reason
+        ):
+            self.fail_current_execution(
+                f"grasp failed at shelf: {reason}; target was already touched, skip this item"
+            )
+            return
         if product_name == "sanmingzhi" and (
             "closed gripper without touching target" in reason
             or "creep timeout without target contact" in reason
@@ -2972,6 +2985,50 @@ class PickPlaceClient(Node):
         profile = self.profile_for_product(getattr(task, "product_name", "kele"))
         level = str(getattr(task, "level", "L2"))
         product_name = str(getattr(task, "product_name", "kele"))
+        if TEST_ORACLE_ENABLED and GT_FAST_NAV and product_name == "kele":
+            # GT visual scoring mode uses exact runtime-layout targets and the
+            # referee oracle.  Keep the shelf standoff near the proven coke
+            # tolerance: a 5-6 cm lateral parking error plus yaw tolerance can
+            # push the known slot outside the gripper lateral reach before the
+            # grasp even starts.
+            profile["shelf_pos_tol"] = max(
+                float(profile.get("shelf_pos_tol", SHELF_FINAL_POS_TOL)),
+                GT_FAST_SHELF_POS_TOL,
+            )
+            profile["creep_timeout"] = max(float(profile.get("creep_timeout", CREEP_TIMEOUT)), 60.0)
+            # In the visual GT run the left fingertip was visibly aimed at the
+            # bottle centre.  That means the *finger*, not the two-finger
+            # midline, became the reference and the bottle was pushed over
+            # before the close could hold it.  GT uses an exact slot centre, so
+            # keep one fixed midline bias and disable the ordinary retry
+            # dithers that are useful for noisy vision but harmful for a known
+            # target.  Also close soon after a valid touch instead of grinding
+            # from ~7 cm down to 3 cm, which toppled the bottle in the local
+            # referee run.
+            profile["center_x_bias"] = -0.016
+            profile["approach_x_retry_scale"] = 0.0
+            profile["empty_grasp_x_retry_scale"] = 0.0
+            profile["creep_dy_offsets"] = (0.0,)
+            profile["touch_final_close_remaining"] = max(
+                float(profile.get("touch_final_close_remaining", 0.030)),
+                0.070,
+            )
+            profile["touch_close_lateral_err"] = max(
+                float(profile.get("touch_close_lateral_err", TOUCH_CLOSE_LATERAL_ERR)),
+                0.018,
+            )
+            profile["touch_recenter_lateral_err"] = max(
+                float(profile.get("touch_recenter_lateral_err", TOUCH_RECENTER_LATERAL_ERR)),
+                0.022,
+            )
+            profile["creep_precontact_guard_lateral"] = max(
+                float(profile.get("creep_precontact_guard_lateral", CREEP_PRECONTACT_GUARD_LATERAL)),
+                0.050,
+            )
+            profile["creep_near_lateral_abort"] = max(
+                float(profile.get("creep_near_lateral_abort", CREEP_NEAR_LATERAL_ABORT)),
+                0.050,
+            )
         deploy_offset = np.asarray(
             profile.get("deploy_offset", DEPLOY_OFFSET),
             dtype=float,
@@ -3695,8 +3752,13 @@ class PickPlaceClient(Node):
         if not self._neighbor_clearance_ok(object_world):
             return False
         self.lock_grasp_geometry(object_world, source="direct-slot")
+        fallback_reason = (
+            "GT fast path; using known task slot geometry"
+            if self.test_oracle_enabled and GT_FAST_NAV
+            else "RGB-D timeout; using known task slot geometry"
+        )
         self.get_logger().warn(
-            "[perception] RGB-D timeout; using known task slot geometry "
+            f"[perception] {fallback_reason} "
             f"for one grasp attempt: OBJECT={np.round(self.OBJECT_WORLD, 3)}"
         )
         return True
@@ -3741,6 +3803,20 @@ class PickPlaceClient(Node):
             "[perception] final RGB-D timeout; using confirmed inventory slot "
             f"for one grasp attempt: OBJECT={np.round(self.OBJECT_WORLD, 3)}"
         )
+        return True
+
+    def start_deploy_from_locked_target(self):
+        """Plan the pre-grasp arm pose for the already locked grasp frame."""
+        if not self.arm_to_reachable_deploy(self.DEPLOY_WORLD, rot=self.grasp_rot):
+            return False
+        self.deploy_set = True
+        deploy_slew = self.grasp_profile.get("deploy_arm_slew")
+        if deploy_slew is not None:
+            self.place_arm_slew = float(deploy_slew)
+            self.place_arm_slow = True
+        self._deploy_base_xy = np.asarray(self.base_xy, dtype=float).copy()
+        self._deploy_base_yaw = float(self.base_yaw)
+        self.state_t0 = self.now()
         return True
 
     @property
@@ -6856,6 +6932,12 @@ class PickPlaceClient(Node):
             final_turn_cmd = float(np.clip(final_turn_cmd, -carry_angular, carry_angular))
         self.set_twist(0.0, final_turn_cmd)
         final_turn_tol = SHELF_FINAL_YAW_TOL if self.phase == NAV_SHELF else self.turn_tol
+        if self.phase == NAV_SHELF and self.test_oracle_enabled and GT_FAST_NAV:
+            # GT scoring mode uses exact slot geometry; a loose final-yaw gate
+            # makes the known slot fall outside the gripper lateral reach and
+            # the robot then burns retries while "not grabbing".  Treat this
+            # value as a tightening cap, not a relaxation.
+            final_turn_tol = min(final_turn_tol, GT_FAST_FINAL_YAW_TOL)
         if abs(yaw_err) < final_turn_tol:
             self.set_twist(0.0, 0.0)
             self.final_turn_progress_yaw = None
@@ -7326,7 +7408,38 @@ class PickPlaceClient(Node):
                 else:
                     self.tc[2] = self.grasp_slide
                 self.tc[18] = float(self.grasp_profile.get("grip_preopen", GRIP_OPEN))
-                if not self.target_locked and self.now() - self.state_t0 < DETECT_DWELL:
+                gt_fast_direct_locked = False
+                if (
+                    self.test_oracle_enabled
+                    and GT_FAST_NAV
+                    and self.has_direct_official_target()
+                    and not self.target_locked
+                    and not self.slot_geometry_invalid
+                ):
+                    # GT/direct-task scoring already has the referee-provided
+                    # public slot pose.  Waiting for the visual detector here
+                    # only makes the robot stare at the shelf and then consume
+                    # grasp retries through the timeout path.  Keep anonymous
+                    # search on the normal perception path, but let GT use the
+                    # locked runtime-layout geometry immediately.
+                    gt_fast_direct_locked = self.lock_direct_task_geometry_fallback()
+                    if gt_fast_direct_locked:
+                        self.get_logger().warn(
+                            "[gt_fast] direct slot geometry locked before "
+                            "deploy detection dwell"
+                        )
+                if gt_fast_direct_locked:
+                    if self.start_deploy_from_locked_target():
+                        pass
+                    else:
+                        self.target_locked = False
+                        self.OBJECT_WORLD = None
+                        self.PINCH_WORLD = None
+                        self.GRASP_ENDPOINT_WORLD = None
+                        self.DEPLOY_WORLD = None
+                        self.CREEP_STOP_Y = None
+                        self.retry_local_grasp("gt fast direct geometry IK failed")
+                elif not self.target_locked and self.now() - self.state_t0 < DETECT_DWELL:
                     pass
                 elif self._lock_target():
                     if self.active_search_mode():
@@ -7334,16 +7447,7 @@ class PickPlaceClient(Node):
                         # grasp height so arm_to_reachable_deploy() plans the
                         # continuous path in the correct kinematic slice.
                         self.tc[2] = self.grasp_slide
-                    if self.arm_to_reachable_deploy(self.DEPLOY_WORLD, rot=self.grasp_rot):
-                        self.deploy_set = True
-                        deploy_slew = self.grasp_profile.get("deploy_arm_slew")
-                        if deploy_slew is not None:
-                            self.place_arm_slew = float(deploy_slew)
-                            self.place_arm_slow = True
-                        self._deploy_base_xy = np.asarray(self.base_xy, dtype=float).copy()
-                        self._deploy_base_yaw = float(self.base_yaw)
-                        self.state_t0 = self.now()
-                    else:
+                    if not self.start_deploy_from_locked_target():
                         # A top-clamp pose that is outside IK reach cannot be
                         # fixed by a lateral retry at this shelf.  Retire the
                         # physical slot so the task manager selects the next
@@ -7403,18 +7507,7 @@ class PickPlaceClient(Node):
                             # Otherwise an upper tissue box can be reachable
                             # through its reserved creep approach yet be
                             # rejected by this fallback path.
-                            if self.arm_to_reachable_deploy(
-                                self.DEPLOY_WORLD, rot=self.grasp_rot
-                            ):
-                                self.deploy_set = True
-                                deploy_slew = self.grasp_profile.get("deploy_arm_slew")
-                                if deploy_slew is not None:
-                                    self.place_arm_slew = float(deploy_slew)
-                                    self.place_arm_slow = True
-                                self._deploy_base_xy = np.asarray(self.base_xy, dtype=float).copy()
-                                self._deploy_base_yaw = float(self.base_yaw)
-                                self.state_t0 = self.now()
-                            else:
+                            if not self.start_deploy_from_locked_target():
                                 self.target_locked = False
                                 self.OBJECT_WORLD = None
                                 self.PINCH_WORLD = None

@@ -1609,6 +1609,48 @@ class NavigationTests(unittest.TestCase):
         self.assertIn("limited=({self.des_lin:.2f},{self.des_ang:.2f})", source)
         self.assertIn("pub=({self.cur_lin:.2f},{self.cur_ang:.2f})", source)
 
+    def test_gt_fast_direct_slot_skips_deploy_detection_dwell(self):
+        """GT/direct-slot mode must not wait for detector dwell before grasping.
+
+        The local GT scoring run already has a referee-provided public slot
+        pose.  If DEPLOY waits for visual detections first, the robot visibly
+        hesitates at the shelf and can burn all local grasp retries through
+        detection timeouts even though the target geometry is known.
+        """
+        source = (
+            REPO_ROOT / "examples" / "supermarket_sorting"
+            / "supermarket_sorting_client.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("def start_deploy_from_locked_target(self):", source)
+        self.assertIn("and GT_FAST_NAV", source)
+        fast_lock = (
+            "gt_fast_direct_locked = self.lock_direct_task_geometry_fallback()"
+        )
+        dwell_wait = (
+            "elif not self.target_locked and self.now() - self.state_t0 < DETECT_DWELL"
+        )
+        self.assertIn(fast_lock, source)
+        self.assertIn(dwell_wait, source)
+        self.assertIn("final_turn_tol = min(final_turn_tol, GT_FAST_FINAL_YAW_TOL)", source)
+        self.assertNotIn("final_turn_tol = max(final_turn_tol, GT_FAST_FINAL_YAW_TOL)", source)
+        self.assertIn('profile["center_x_bias"] = -0.016', source)
+        self.assertIn('profile["approach_x_retry_scale"] = 0.0', source)
+        self.assertIn('profile["creep_dy_offsets"] = (0.0,)', source)
+        self.assertIn('profile["touch_final_close_remaining"]', source)
+        self.assertIn('"closed gripper without grasp evidence" in reason', source)
+        self.assertIn("target was already touched, skip this item", source)
+        decision_source = (
+            REPO_ROOT / "examples" / "supermarket_sorting"
+            / "supermarket_sorting_decision_client.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn('"closed gripper without grasp evidence" in reason', decision_source)
+        self.assertIn("self.current_target_touched()", decision_source)
+        self.assertLess(
+            source.index(fast_lock),
+            source.index(dwell_wait),
+            "GT direct geometry fallback must run before the deploy dwell wait",
+        )
+
     def test_shelf_recovery_uses_dynamic_astar_after_stuck_event(self):
         fake_modules = {
             "rclpy": types.SimpleNamespace(init=lambda: None, spin=lambda node: None, ok=lambda: False, shutdown=lambda: None),
